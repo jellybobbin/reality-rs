@@ -12,7 +12,7 @@ Files of interest:
 
 Quick usage (run as root):
 
-1) Prepare server config and install everything (interactive by default):
+1. Prepare server config and install everything (interactive by default):
 
 ```sh
 sudo ./installer.sh install
@@ -25,12 +25,13 @@ sudo ./installer.sh install example.com 443
 ```
 
 This will (summary):
+
 - install prerequisites (`curl`, `unzip`, `openssl`) where supported
 - download and install the server binary to `/usr/local/bin/anyreality-server` (default `BIN_DIR`)
 - generate REALITY's per-connection temporary certificates and keys at runtime
-- write the server configuration to `/etc/anyreality/config.toml`
-- write a client config to `/etc/anyreality/client-config.toml`
-- write a systemd unit to `/etc/systemd/system/anyreality.service` and attempt to enable/start it (best-effort)
+- write the server configuration to `/etc/anyreality-server/anyreality-server-config.toml`
+- write a client config to `/etc/anyreality-server/anyreality-server-client-config.toml`
+- write a systemd unit to `/etc/systemd/system/anyreality-server.service` and attempt to enable/start it (best-effort)
 - finally, print the client config to the terminal so you can copy it to a client machine
 
 Notes and recommendations (accurate to the current script):

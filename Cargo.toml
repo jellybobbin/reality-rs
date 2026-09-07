@@ -97,7 +97,7 @@ tikv-jemallocator = "0.7.0"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt"] }
 tokio-rustls = "0.26.5"
 toml = "1.1.5"
-webpki = { package = "rustls-webpki", version = "=0.104.0-alpha.6", features = [
+webpki = { package = "rustls-webpki", version = "=0.104.0-alpha.7", features = [
   "alloc",
 ], default-features = false }
 webpki-roots = "1.0.9"

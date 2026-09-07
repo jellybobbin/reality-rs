@@ -21,13 +21,15 @@ anyreality_bin_url="https://github.com/ssrlive/reality-rs/releases/latest/downlo
 # some foreign sites likely accessible from China (common CDNs, developer sites)
 STOCK_SITES=(cdn.jsdelivr.net jsdelivr.com stackoverflow.com developer.mozilla.org python.org pypi.org crates.io golang.org nodejs.org npmjs.com cloudflare.com nginx.org rust-lang.org debian.org ubuntu.com)
 
+SERVICE_NAME="anyreality-server"
 BIN_DIR=${BIN_DIR:-/usr/local/bin}
-BIN_FILE="anyreality-server"
-INSTALL_DIR=${INSTALL_DIR:-/etc/anyreality}
-SERVER_CONFIG="${INSTALL_DIR}/config.toml"
+BIN_FILE="${SERVICE_NAME}"
+INSTALL_DIR=${INSTALL_DIR:-/etc/${SERVICE_NAME}}
+SERVER_CONFIG="${INSTALL_DIR}/${SERVICE_NAME}-config.toml"
+CLIENT_CONFIG="${INSTALL_DIR}/${SERVICE_NAME}-client-config.toml"
 TARGET_SITE=""
 LISTEN_PORT=""
-SERVICE_UNIT_NAME="anyreality.service"
+SERVICE_UNIT_NAME="${SERVICE_NAME}.service"
 
 select_random_site() {
   # choose a random site and generate certificate
@@ -100,15 +102,15 @@ install_server_binary() {
   trap cleanup EXIT
 
   echo -e "${Green}Downloading anyreality from: $anyreality_bin_url${ColorOff}"
-  curl -L "$anyreality_bin_url" -o "$TMPDIR/anytls.zip"
+  curl -L "$anyreality_bin_url" -o "$TMPDIR/${SERVICE_NAME}.zip"
 
   echo -e "${Green}Extracting...${ColorOff}"
-  unzip -o "$TMPDIR/anytls.zip" -d "$TMPDIR" >/dev/null
+  unzip -o "$TMPDIR/${SERVICE_NAME}.zip" -d "$TMPDIR" >/dev/null
 
   # Prefer the server binary; avoid installing the client
-  binfile=$(find "$TMPDIR" -type f -name "$BIN_FILE" -print -quit || true)
+  binfile=$(find "$TMPDIR" -type f -name "anyreality-server" -print -quit || true)
   if [ -z "$binfile" ]; then
-    echo -e "${Red}Could not locate $BIN_FILE binary in archive${ColorOff}"
+    echo -e "${Red}Could not locate anyreality-server binary in archive${ColorOff}"
     return 1
   fi
 
@@ -128,7 +130,7 @@ resolve_hostaddr() {
 
   hostaddr=$(curl -6 -sS https://ip.sb 2>/dev/null || true)
   if [ -n "$hostaddr" ]; then
-    printf '%s\n' "$hostaddr"
+    printf '[%s]\n' "$hostaddr"
     return 0
   fi
 
@@ -154,18 +156,16 @@ generate_reality_keys() {
 write_server_config() {
   local the_site="$1"
   local listen_port="$2"
+  local password="$3"
   cat > "$SERVER_CONFIG" <<EOF
 [reality]
-# shortId: 8-byte hex string (16 hex chars)
 shortId = "$shortid"
-# privateKey: base64url no-padding X25519 private key (32 bytes encoded)
 privateKey = "$priv"
 version = "010203"
 serverNames = ["$the_site"]
 
 [anytls]
-# anytls password used by server
-password = "$anytls_password"
+password = "$password"
 
 [server]
 listen = "0.0.0.0:${listen_port}"
@@ -176,19 +176,17 @@ EOF
 write_client_config() {
   local the_site="$1"
   local the_port="$2"
-  CLIENT_OUT="$INSTALL_DIR/client-config.toml"
-  hostaddr=$(resolve_hostaddr)
-  cat > "$CLIENT_OUT" <<EOF
+  local password="$3"
+  local hostaddr=$(resolve_hostaddr)
+  cat > "${CLIENT_CONFIG}" <<EOF
 [reality]
-# shortId: 8-byte hex string (16 hex chars)
 shortId = "$shortid"
-# publicKey (base64url no-padding) — client may need server public for some flows
 publicKey = "$pub"
 version = "010203"
 serverName = "$the_site"
 
 [anytls]
-password = "$anytls_password"
+password = "$password"
 idleCheckSecs = 30
 idleTimeoutSecs = 30
 minIdleSessions = 5
@@ -197,19 +195,19 @@ minIdleSessions = 5
 listen = "127.0.0.1:2080"
 serverAddr = "${hostaddr}:${the_port}"
 EOF
-  echo -e "${Green}Wrote client config: $CLIENT_OUT${ColorOff}"
+  echo -e "${Green}Wrote client config: ${CLIENT_CONFIG}${ColorOff}"
 }
 
 install_systemd_service() {
   local service_path="/etc/systemd/system/$SERVICE_UNIT_NAME"
   cat > "$service_path" <<EOF
 [Unit]
-Description=anyreality server
+Description=${SERVICE_NAME}
 After=network.target
 
 [Service]
 # Running as root by default; create and switch to a dedicated user manually if desired
-ExecStart=$BIN_DIR/$BIN_FILE --config $SERVER_CONFIG
+ExecStart=${BIN_DIR}/${BIN_FILE} --config ${SERVER_CONFIG}
 Restart=on-failure
 
 [Install]
@@ -263,12 +261,12 @@ install_anyreality_all() {
   generate_reality_keys || { echo -e "${Red}REALITY key generation failed${ColorOff}" >&2; exit 1; }
 
   # generate anytls password (kept in-memory only; do not create a password file)
-  anytls_password=$(generate_anytls_password)
+  local anytls_password=$(generate_anytls_password)
   mkdir -p "$INSTALL_DIR"
 
   # write configs
-  write_server_config "$TARGET_SITE" "$LISTEN_PORT"
-  write_client_config "$TARGET_SITE" "$LISTEN_PORT"
+  write_server_config "$TARGET_SITE" "$LISTEN_PORT" "${anytls_password}"
+  write_client_config "$TARGET_SITE" "$LISTEN_PORT" "${anytls_password}"
 
   # install and start systemd service (best-effort)
   if command -v systemctl >/dev/null 2>&1; then
@@ -279,9 +277,8 @@ install_anyreality_all() {
   fi
 
   # Print client config to terminal for easy copy/paste
-  CLIENT_OUT="$INSTALL_DIR/client-config.toml"
-  echo -e "${Green}\n==== Client config ($CLIENT_OUT) ====\n${ColorOff}"
-  cat "$CLIENT_OUT" || true
+  echo -e "${Green}\n==== Client config (${CLIENT_CONFIG}) ====\n${ColorOff}"
+  cat "${CLIENT_CONFIG}" || true
 
   echo -e "${Green}\nInstall complete. Server config: $SERVER_CONFIG; client config printed above.\n${ColorOff}"
 }
