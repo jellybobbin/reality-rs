@@ -32,11 +32,8 @@ use anytls::uot::{
 use clap::Parser;
 use core::net::SocketAddr;
 use core::time::Duration;
-use rustls::ClientConfig;
 use rustls::Connection;
-use rustls::RootCertStore;
 use rustls::client::{ClientHelloProfile, Resumption};
-use rustls::pki_types::ServerName;
 use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};
 use sha2::{Digest, Sha256};
@@ -54,7 +51,17 @@ use tokio::io::{
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 const MAX_UDP_RELAY_PACKET_SIZE: usize = 65_535;
+const DEFAULT_LOG_LEVEL: &str = "info";
+const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:1080";
+const DEFAULT_IDLE_CHECK_SECS: u64 = 30;
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_MIN_IDLE_SESSIONS: usize = 5;
 const DEFAULT_MAX_STREAMS_PER_SESSION: usize = 8;
+const DEFAULT_CLIENT_HELLO_PROFILE: &str = "default";
+const DEFAULT_HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_HTTP_HEADER_LIMIT: usize = 16 * 1024;
+const DEFAULT_IO_BUFFER_SIZE: usize = 16 * 1024;
+const DEFAULT_PADDING_LEN: usize = 0;
 const STREAM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Parser)]
@@ -65,7 +72,7 @@ struct Args {
     config: PathBuf,
 
     /// Log filter (off/error/warn/info/debug/trace or env-style spec).
-    #[arg(short, long, default_value = "info")]
+    #[arg(short, long, default_value = DEFAULT_LOG_LEVEL)]
     log: log::LevelFilter,
 }
 
@@ -73,16 +80,16 @@ struct Args {
 #[serde(rename_all = "camelCase")]
 struct ClientConfigFile {
     #[serde(default)]
-    reality: Option<ClientRealityConfigFile>,
+    reality: Option<ClientRealityConfig>,
     #[serde(default)]
-    anytls: Option<ClientAnytlsConfigFile>,
+    anytls: Option<ClientAnytlsConfig>,
     #[serde(default)]
-    client: Option<ClientRuntimeConfigFile>,
+    client: Option<ClientRuntimeConfig>,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ClientRealityConfigFile {
+struct ClientRealityConfig {
     #[serde(default)]
     public_key: Option<String>,
     #[serde(default)]
@@ -97,7 +104,7 @@ struct ClientRealityConfigFile {
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ClientAnytlsConfigFile {
+struct ClientAnytlsConfig {
     #[serde(default)]
     password: Option<String>,
     #[serde(default)]
@@ -114,7 +121,7 @@ struct ClientAnytlsConfigFile {
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ClientRuntimeConfigFile {
+struct ClientRuntimeConfig {
     #[serde(default)]
     listen: Option<SocketAddr>,
     #[serde(default)]
@@ -123,29 +130,11 @@ struct ClientRuntimeConfigFile {
     probe_proxy: Option<SocketAddr>,
 }
 
-#[derive(Clone, Debug)]
-struct RealityClientConfigResolved {
-    listen: SocketAddr,
-    server_addr: String,
-    probe_proxy: Option<SocketAddr>,
-    password: String,
-    client_id: Option<uuid::Uuid>,
-    idle_check_secs: u64,
-    idle_timeout_secs: u64,
-    min_idle_sessions: usize,
-    max_streams_per_session: usize,
-    public_key: String,
-    short_id: String,
-    version: String,
-    server_name: String,
-    client_hello_profile: ClientHelloProfile,
-}
-
 #[derive(Clone)]
 struct DialCtx {
     server_addr: String,
     probe_proxy: Option<SocketAddr>,
-    tls_config: Arc<ClientConfig>,
+    tls_config: Arc<rustls::ClientConfig>,
     server_name: String,
     password_sha256: [u8; 32],
     client_id: Option<uuid::Uuid>,
@@ -159,18 +148,48 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log)).init();
 
     let resolved = resolve_client_config(&args.config)?;
-    let tls_config = Arc::new(build_client_config(&resolved)?);
-    let server_addr = resolved.server_addr.clone();
-    let server_name = resolved.server_name.clone();
+    let reality = resolved
+        .reality
+        .as_ref()
+        .expect("validated reality config");
+    let anytls = resolved
+        .anytls
+        .as_ref()
+        .expect("validated anytls config");
+    let client = resolved
+        .client
+        .as_ref()
+        .expect("validated client config");
+    let tls_config = Arc::new(build_rustls_client_config(reality)?);
+    let listen = client
+        .listen
+        .expect("validated client listen address");
+    let server_addr = client
+        .server_addr
+        .clone()
+        .expect("validated client server address");
+    let server_name = reality
+        .server_name
+        .clone()
+        .expect("validated reality server name");
     let padding = DefaultPaddingFactory::load();
+
+    let password_sha256 = Sha256::digest(
+        anytls
+            .password
+            .as_deref()
+            .expect("validated anytls password")
+            .as_bytes(),
+    )
+    .into();
 
     let dial_ctx = Arc::new(DialCtx {
         server_addr: server_addr.clone(),
-        probe_proxy: resolved.probe_proxy,
+        probe_proxy: client.probe_proxy,
         tls_config,
         server_name: server_name.clone(),
-        password_sha256: Sha256::digest(resolved.password.as_bytes()).into(),
-        client_id: resolved.client_id,
+        password_sha256,
+        client_id: anytls.client_id,
         padding: padding.clone(),
     });
 
@@ -183,20 +202,19 @@ async fn main() -> Result<()> {
             Box::pin(async move { dial_carrier(ctx).await })
         }),
         padding,
-        Duration::from_secs(resolved.idle_check_secs),
-        Duration::from_secs(resolved.idle_timeout_secs),
-        resolved.min_idle_sessions,
-        resolved.max_streams_per_session,
+        Duration::from_secs(anytls.idle_check_secs.unwrap()),
+        Duration::from_secs(anytls.idle_timeout_secs.unwrap()),
+        anytls.min_idle_sessions.unwrap(),
+        anytls.max_streams_per_session.unwrap(),
     ));
 
     log::info!(
         "REALITY+anytls client: mixed SOCKS5/HTTP {} -> {} (sni={})",
-        resolved.listen,
+        listen,
         server_addr,
         server_name
     );
 
-    let listen: SocketAddr = resolved.listen;
     let listener = TcpListener::bind(listen).await?;
     let auth = Arc::new(NoAuth);
 
@@ -241,7 +259,7 @@ async fn dial_carrier(ctx: Arc<DialCtx>) -> std::io::Result<Box<dyn AsyncReadWri
     let server_name = ctx.server_name.clone();
     let tls = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
         std_tcp.set_nonblocking(false)?;
-        let server_name = ServerName::try_from(server_name)
+        let server_name = rustls::pki_types::ServerName::try_from(server_name)
             .map_err(|err| std::io::Error::other(format!("invalid sni: {err}")))?;
         let mut conn = tls_config
             .connect(server_name)
@@ -269,8 +287,8 @@ async fn dial_carrier(ctx: Arc<DialCtx>) -> std::io::Result<Box<dyn AsyncReadWri
     let padding_len: u16 = padding_sizes
         .first()
         .copied()
-        .map(|v| u16::try_from(v).unwrap_or(0))
-        .unwrap_or(0);
+        .map(|v| u16::try_from(v).unwrap_or(DEFAULT_PADDING_LEN as u16))
+        .unwrap_or(DEFAULT_PADDING_LEN as u16);
 
     let client_id_bytes = ctx
         .client_id
@@ -355,7 +373,7 @@ async fn handle_http_connect(mut tcp_stream: TcpStream, client: Arc<Client>) -> 
                 bail!("HTTP proxy client closed before sending headers");
             }
             request.push(byte[0]);
-            if request.len() > 16 * 1024 {
+            if request.len() > DEFAULT_HTTP_HEADER_LIMIT {
                 bail!("HTTP proxy request headers are too large");
             }
             if request.ends_with(b"\r\n\r\n") || request.ends_with(b"\n\n") {
@@ -364,7 +382,7 @@ async fn handle_http_connect(mut tcp_stream: TcpStream, client: Arc<Client>) -> 
         }
         Ok::<(), anyhow::Error>(())
     };
-    tokio::time::timeout(Duration::from_secs(10), read_headers)
+    tokio::time::timeout(DEFAULT_HTTP_HEADER_TIMEOUT, read_headers)
         .await
         .context("HTTP proxy header timeout")??;
 
@@ -404,7 +422,7 @@ async fn handle_http_connect(mut tcp_stream: TcpStream, client: Arc<Client>) -> 
     let session_w = session.clone();
     let session_r = session.clone();
     let l2r = tokio::spawn(async move {
-        let mut buffer = vec![0u8; 16 * 1024];
+        let mut buffer = vec![0u8; DEFAULT_IO_BUFFER_SIZE];
         loop {
             match local_read.read(&mut buffer).await {
                 Ok(0) => {
@@ -429,7 +447,7 @@ async fn handle_http_connect(mut tcp_stream: TcpStream, client: Arc<Client>) -> 
         }
     });
     let r2l = tokio::spawn(async move {
-        let mut buffer = vec![0u8; 16 * 1024];
+        let mut buffer = vec![0u8; DEFAULT_IO_BUFFER_SIZE];
         loop {
             match session_r.read(&mut buffer).await {
                 Ok(0) => break,
@@ -506,7 +524,7 @@ async fn handle_tcp_connect(
     let session_r = session.clone();
 
     let l2r = tokio::spawn(async move {
-        let mut buf = vec![0u8; 16 * 1024];
+        let mut buf = vec![0u8; DEFAULT_IO_BUFFER_SIZE];
         let mut err = None;
         let mut local_eof = false;
         loop {
@@ -541,7 +559,7 @@ async fn handle_tcp_connect(
     });
 
     let r2l = tokio::spawn(async move {
-        let mut buf = vec![0u8; 16 * 1024];
+        let mut buf = vec![0u8; DEFAULT_IO_BUFFER_SIZE];
         loop {
             match session_r.read(&mut buf).await {
                 Ok(0) => break,
@@ -703,8 +721,8 @@ async fn setup_uot_request(stream: &Arc<AnytlsStream>) -> Result<()> {
 
 // === helpers ===
 
-fn resolve_client_config(config_path: &Path) -> Result<RealityClientConfigResolved> {
-    let file_config = load_client_config_file(config_path)?;
+fn resolve_client_config(config_path: &Path) -> Result<ClientConfigFile> {
+    let mut file_config = load_client_config_file(config_path)?;
     let reality = file_config
         .reality
         .as_ref()
@@ -718,82 +736,84 @@ fn resolve_client_config(config_path: &Path) -> Result<RealityClientConfigResolv
         .as_ref()
         .ok_or_else(|| anyhow!("client config requires a [client] section"))?;
 
-    let listen = client
-        .listen
-        .unwrap_or_else(|| "127.0.0.1:1080".parse().unwrap());
-    let server_addr = client
+    client
         .server_addr
-        .clone()
+        .as_ref()
         .ok_or_else(|| anyhow!("client.serverAddr must be set in config"))?;
     let password = anytls
         .password
-        .clone()
+        .as_deref()
         .ok_or_else(|| anyhow!("anytls.password must be set in config"))?;
     if password.is_empty() {
         bail!("anytls.password must not be empty");
     }
 
-    let client_id = anytls.client_id;
-
-    let idle_check_secs = anytls.idle_check_secs.unwrap_or(30);
-    let idle_timeout_secs = anytls.idle_timeout_secs.unwrap_or(30);
-    // Keep the idle floor at zero by default so timed-out sessions are not
-    // preserved indefinitely. Users can opt back in via config if they want
-    // a warm pool.
-    let min_idle_sessions = anytls.min_idle_sessions.unwrap_or(0);
-    let max_streams_per_session = anytls
-        .max_streams_per_session
-        .unwrap_or(DEFAULT_MAX_STREAMS_PER_SESSION)
-        .max(1);
-
-    let short_id = reality
+    // Keep a small warm pool by default so the first proxied requests avoid
+    // paying the full carrier setup cost.
+    reality
         .short_id
-        .clone()
+        .as_ref()
         .ok_or_else(|| anyhow!("reality.shortId must be set in config"))?;
-    let public_key = reality
+    reality
         .public_key
-        .clone()
+        .as_ref()
         .ok_or_else(|| anyhow!("reality.publicKey must be set in config"))?;
-    let version = reality
+    reality
         .version
-        .clone()
+        .as_ref()
         .ok_or_else(|| anyhow!("reality.version must be set in config"))?;
-    let server_name = reality
+    reality
         .server_name
-        .clone()
+        .as_ref()
         .ok_or_else(|| anyhow!("reality.serverName must be set in config"))?;
-    let client_hello_profile = match reality.client_hello_profile.as_deref() {
-        None | Some("default") => ClientHelloProfile::Default,
+    match reality.client_hello_profile.as_deref() {
+        None | Some(DEFAULT_CLIENT_HELLO_PROFILE) => ClientHelloProfile::Default,
         Some("chrome") => ClientHelloProfile::Chrome,
         Some("firefox") => ClientHelloProfile::Firefox,
         Some("safari") => ClientHelloProfile::Safari,
         Some(value) => bail!("unsupported reality.clientHelloProfile: {value}"),
     };
 
-    Ok(RealityClientConfigResolved {
-        listen,
-        server_addr,
-        probe_proxy: client.probe_proxy,
-        password,
-        client_id,
-        idle_check_secs,
-        idle_timeout_secs,
-        min_idle_sessions,
-        max_streams_per_session,
-        short_id,
-        public_key,
-        version,
-        server_name,
-        client_hello_profile,
-    })
+    if let Some(client) = file_config.client.as_mut() {
+        client
+            .listen
+            .get_or_insert_with(|| DEFAULT_LISTEN_ADDR.parse().unwrap());
+    }
+    if let Some(anytls) = file_config.anytls.as_mut() {
+        anytls
+            .idle_check_secs
+            .get_or_insert(DEFAULT_IDLE_CHECK_SECS);
+        anytls
+            .idle_timeout_secs
+            .get_or_insert(DEFAULT_IDLE_TIMEOUT_SECS);
+        anytls
+            .min_idle_sessions
+            .get_or_insert(DEFAULT_MIN_IDLE_SESSIONS);
+        anytls
+            .max_streams_per_session
+            .get_or_insert(DEFAULT_MAX_STREAMS_PER_SESSION);
+        if let Some(max_streams) = anytls.max_streams_per_session.as_mut() {
+            *max_streams = (*max_streams).max(1);
+        }
+    }
+
+    Ok(file_config)
 }
 
-fn build_client_config(args: &RealityClientConfigResolved) -> Result<ClientConfig> {
+fn build_rustls_client_config(args: &ClientRealityConfig) -> Result<rustls::ClientConfig> {
     let root_store = load_root_store();
     let mut config = provider::reality::build_reality_client_config_from_xray_fields(
-        parse_reality_version(&args.version),
-        &args.short_id,
-        &args.public_key,
+        parse_reality_version(
+            args.version
+                .as_deref()
+                .ok_or_else(|| anyhow!("reality.version must be set in config"))?,
+        ),
+        args.short_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("reality.shortId must be set in config"))?,
+        args.public_key
+            .as_deref()
+            .ok_or_else(|| anyhow!("reality.publicKey must be set in config"))?,
         root_store,
     )?;
 
@@ -801,13 +821,19 @@ fn build_client_config(args: &RealityClientConfigResolved) -> Result<ClientConfi
     // TLS resumption avoids resumed handshakes tearing down some fresh
     // carriers under burst load.
     config.resumption = Resumption::disabled();
-    config.client_hello_profile = args.client_hello_profile;
+    config.client_hello_profile = match args.client_hello_profile.as_deref() {
+        None | Some(DEFAULT_CLIENT_HELLO_PROFILE) => ClientHelloProfile::Default,
+        Some("chrome") => ClientHelloProfile::Chrome,
+        Some("firefox") => ClientHelloProfile::Firefox,
+        Some("safari") => ClientHelloProfile::Safari,
+        Some(value) => bail!("unsupported reality.clientHelloProfile: {value}"),
+    };
 
     Ok(config)
 }
 
-fn load_root_store() -> RootCertStore {
-    let mut root_store = RootCertStore::empty();
+fn load_root_store() -> rustls::RootCertStore {
+    let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(
         webpki_roots::TLS_SERVER_ROOTS
             .iter()
@@ -818,15 +844,13 @@ fn load_root_store() -> RootCertStore {
 
 fn load_client_config_file(path: &Path) -> Result<ClientConfigFile> {
     let contents = std::fs::read_to_string(path)?;
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default()
-    {
-        "json" => Ok(serde_json::from_str(&contents)?),
-        "toml" => Ok(toml::from_str(&contents)?),
-        _ => bail!("unsupported REALITY config format: {}", path.display()),
+    if let Ok(config) = serde_json::from_str(&contents) {
+        return Ok(config);
     }
+    if let Ok(config) = toml::from_str(&contents) {
+        return Ok(config);
+    }
+    bail!("unsupported REALITY config format: {}", path.display());
 }
 
 fn parse_reality_version(version: &str) -> [u8; 3] {

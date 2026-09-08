@@ -147,7 +147,7 @@ generate_reality_keys() {
   priv=$(echo "$keys_out" | sed -n 's/^privateKey:[[:space:]]*//p' | tr -d '\r')
   pub=$(echo "$keys_out" | sed -n 's/^publicKey:[[:space:]]*//p' | tr -d '\r')
   shortid=$(echo "$keys_out" | sed -n 's/^shortId:[[:space:]]*//p' | tr -d '\r')
-  if [ -z "$priv" ] || [ -z "$shortid" ]; then
+  if [ -z "$pub" ] || [ -z "$priv" ] || [ -z "$shortid" ]; then
     printf 'Failed to generate REALITY keys; output:\n%s\n' "$keys_out" >&2
     return 1
   fi
@@ -187,9 +187,7 @@ serverName = "$the_site"
 
 [anytls]
 password = "$password"
-idleCheckSecs = 30
-idleTimeoutSecs = 30
-minIdleSessions = 5
+maxStreamsPerSession = 4
 
 [client]
 listen = "127.0.0.1:2080"
