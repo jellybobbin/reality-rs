@@ -19,7 +19,7 @@
 //! - SOCKS5 supports `CONNECT` (TCP) and `UDP ASSOCIATE` (anytls UoT
 //!   Datagram mode, see `anytls::uot`).
 
-use anyreality::async_bridge;
+use anyreality::{AnytlsStreamReader, async_bridge};
 
 use anyhow::{Context, Result, anyhow, bail};
 use anytls::AsyncReadWrite;
@@ -45,9 +45,7 @@ use socks5_impl::server::connection::{
 use socks5_impl::server::{AssociatedUdpSocket, UdpAssociate};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader,
-};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 const MAX_UDP_RELAY_PACKET_SIZE: usize = 65_535;
@@ -60,7 +58,6 @@ const DEFAULT_MAX_STREAMS_PER_SESSION: usize = 8;
 const DEFAULT_CLIENT_HELLO_PROFILE: &str = "default";
 const DEFAULT_HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_HTTP_HEADER_LIMIT: usize = 16 * 1024;
-const DEFAULT_IO_BUFFER_SIZE: usize = 16 * 1024;
 const DEFAULT_PADDING_LEN: usize = 0;
 const STREAM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -421,58 +418,14 @@ async fn handle_http_connect(mut tcp_stream: TcpStream, client: Arc<Client>) -> 
         let _ = session.terminate().await;
         return Err(err.into());
     }
-    tcp_stream
+    if let Err(error) = tcp_stream
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await?;
-
-    let (mut local_read, mut local_write) = tcp_stream.into_split();
-    let session_w = session.clone();
-    let session_r = session.clone();
-    let l2r = tokio::spawn(async move {
-        let mut buffer = vec![0u8; DEFAULT_IO_BUFFER_SIZE];
-        loop {
-            match local_read.read(&mut buffer).await {
-                Ok(0) => {
-                    let _ = finish_logical_stream(&session_w).await;
-                    break;
-                }
-                Ok(count) => {
-                    if session_w
-                        .write(&buffer[..count])
-                        .await
-                        .is_err()
-                    {
-                        let _ = session_w.terminate().await;
-                        break;
-                    }
-                }
-                Err(_) => {
-                    let _ = session_w.terminate().await;
-                    break;
-                }
-            }
-        }
-    });
-    let r2l = tokio::spawn(async move {
-        let mut buffer = vec![0u8; DEFAULT_IO_BUFFER_SIZE];
-        loop {
-            match session_r.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(count)
-                    if local_write
-                        .write_all(&buffer[..count])
-                        .await
-                        .is_err() =>
-                {
-                    break;
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-        let _ = local_write.shutdown().await;
-    });
-    let _ = tokio::join!(l2r, r2l);
+        .await
+    {
+        let _ = session.close().await;
+        return Err(error.into());
+    }
+    anyreality::relay_tcp(tcp_stream, session).await?;
     Ok(())
 }
 
@@ -527,71 +480,17 @@ async fn handle_tcp_connect(
         return Err(err.into());
     }
 
-    let ready = connect_req
+    let ready = match connect_req
         .reply(Reply::Succeeded, bind_addr)
-        .await?;
-
-    let (mut local_read, mut local_write) = ready.into_split();
-    let session_w = session.clone();
-    let session_r = session.clone();
-
-    let l2r = tokio::spawn(async move {
-        let mut buf = vec![0u8; DEFAULT_IO_BUFFER_SIZE];
-        let mut err = None;
-        let mut local_eof = false;
-        loop {
-            match local_read.read(&mut buf).await {
-                Ok(0) => {
-                    local_eof = true;
-                    break;
-                }
-                Ok(n) => {
-                    if let Err(e) = session_w.write(&buf[..n]).await {
-                        err = Some(e);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if is_nonfatal_local_disconnect(&e) {
-                        log::trace!("tcp tunnel local->proxy closed: {e}");
-                        local_eof = true;
-                    } else {
-                        err = Some(e);
-                    }
-                    break;
-                }
-            }
+        .await
+    {
+        Ok(ready) => ready,
+        Err(error) => {
+            let _ = session.close().await;
+            return Err(error.into());
         }
-        if let Some(e) = err {
-            let _ = session_w.terminate().await;
-            log::debug!("tcp tunnel local->proxy error: {e}");
-        } else if local_eof {
-            let _ = finish_logical_stream(&session_w).await;
-        }
-    });
-
-    let r2l = tokio::spawn(async move {
-        let mut buf = vec![0u8; DEFAULT_IO_BUFFER_SIZE];
-        loop {
-            match session_r.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if local_write
-                        .write_all(&buf[..n])
-                        .await
-                        .is_err()
-                    {
-                        let _ = finish_logical_stream(&session_r).await;
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = local_write.shutdown().await;
-    });
-
-    let _ = tokio::join!(l2r, r2l);
+    };
+    anyreality::relay_tcp(ready, session).await?;
     log::trace!("tcp tunnel to {target} closed");
     Ok(())
 }
@@ -710,10 +609,6 @@ mod http_diagnostic_tests {
     }
 }
 
-async fn finish_logical_stream(stream: &Arc<AnytlsStream>) -> std::io::Result<()> {
-    stream.close().await
-}
-
 async fn wait_for_stream_handshake(stream: &Arc<AnytlsStream>) -> std::io::Result<()> {
     let started = tokio::time::Instant::now();
     log::debug!(
@@ -746,17 +641,6 @@ async fn wait_for_stream_handshake(stream: &Arc<AnytlsStream>) -> std::io::Resul
             ),
         )
     })
-}
-
-fn is_nonfatal_local_disconnect(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::NotConnected
-            | std::io::ErrorKind::UnexpectedEof
-    )
 }
 
 async fn handle_udp_associate(
@@ -820,10 +704,10 @@ async fn handle_udp_associate(
     let session_writer = session.clone();
     let mut session_reader = AnytlsStreamReader::new(session.clone());
 
-    let result: Result<()> = loop {
-        tokio::select! {
-            res = listen_udp.recv_from() => {
-                let (pkt, frag, destination, src_addr) = res?;
+    let result: Result<()> = {
+        let upload = async {
+            loop {
+                let (pkt, frag, destination, src_addr) = listen_udp.recv_from().await?;
                 if frag != 0 {
                     break Err(anyhow!("SOCKS UDP fragmentation is not supported"));
                 }
@@ -831,7 +715,9 @@ async fn handle_udp_associate(
                 match *guard {
                     None => *guard = Some(src_addr),
                     Some(pinned) if pinned != src_addr => {
-                        log::debug!("UDP ASSOCIATE: dropping packet from {src_addr} (pinned to {pinned})");
+                        log::debug!(
+                            "UDP ASSOCIATE: dropping packet from {src_addr} (pinned to {pinned})"
+                        );
                         drop(guard);
                         continue;
                     }
@@ -841,17 +727,28 @@ async fn handle_udp_associate(
                 let frame = uot_encode_packet(UotMode::Datagram, Some(&destination), &pkt)?;
                 session_writer.write(&frame).await?;
             }
-            res = uot_get_packet_from_stream(UotMode::Datagram, &mut session_reader) => {
-                let (source, payload) = res?;
+        };
+        let download = async {
+            loop {
+                let (source, payload) =
+                    uot_get_packet_from_stream(UotMode::Datagram, &mut session_reader).await?;
                 let Some(incoming) = *incoming_addr.lock().await else {
                     continue;
                 };
                 let source = source.ok_or_else(|| anyhow!("UoT datagram missing source"))?;
-                listen_udp.send_to(&payload, 0, source, incoming).await?;
+                listen_udp
+                    .send_to(&payload, 0, source, incoming)
+                    .await?;
             }
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::select! {
+            _ = session.wait_for_abort() => Err(anyhow!("AnyTLS stream aborted")),
+            result = upload => result,
+            result = download => result,
             res = reply.wait_until_closed() => {
-                res?;
-                break Ok(());
+                res.map_err(Into::into)
             }
         }
     };
@@ -1033,61 +930,5 @@ fn parse_hex_nibble(value: u8) -> u8 {
         b'a'..=b'f' => value - b'a' + 10,
         b'A'..=b'F' => value - b'A' + 10,
         _ => panic!("REALITY version must contain only hexadecimal digits"),
-    }
-}
-
-type ReadFuture = Box<dyn core::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>;
-
-// === AsyncRead adapter for AnytlsSession (so UoT helpers can drive it) ===
-
-struct AnytlsStreamReader {
-    inner: Arc<AnytlsStream>,
-    read_fut: Option<core::pin::Pin<ReadFuture>>,
-}
-
-impl AnytlsStreamReader {
-    fn new(inner: Arc<AnytlsStream>) -> Self {
-        Self {
-            inner,
-            read_fut: None,
-        }
-    }
-}
-
-impl AsyncRead for AnytlsStreamReader {
-    fn poll_read(
-        mut self: core::pin::Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> core::task::Poll<std::io::Result<()>> {
-        loop {
-            if let Some(fut) = self.read_fut.as_mut() {
-                match fut.as_mut().poll(cx) {
-                    core::task::Poll::Ready(Ok((v, n))) => {
-                        self.read_fut = None;
-                        buf.put_slice(&v[..n]);
-                        return core::task::Poll::Ready(Ok(()));
-                    }
-                    core::task::Poll::Ready(Err(e)) => {
-                        self.read_fut = None;
-                        return core::task::Poll::Ready(Err(e));
-                    }
-                    core::task::Poll::Pending => return core::task::Poll::Pending,
-                }
-            }
-
-            let remaining = buf.remaining();
-            if remaining == 0 {
-                return core::task::Poll::Ready(Ok(()));
-            }
-
-            let inner = self.inner.clone();
-            self.read_fut = Some(Box::pin(async move {
-                let mut v = vec![0u8; remaining];
-                let n = inner.read(&mut v).await?;
-                v.truncate(n);
-                Ok::<(Vec<u8>, usize), std::io::Error>((v, n))
-            }));
-        }
     }
 }

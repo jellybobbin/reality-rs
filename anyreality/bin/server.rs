@@ -19,7 +19,7 @@
 //! upstream relay that is still draining cannot block later multiplexed
 //! streams on the same carrier.
 
-use anyreality::async_bridge;
+use anyreality::{AnytlsStreamReader, async_bridge};
 
 use aes_gcm::aead::AeadInOut;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -27,10 +27,7 @@ use anyhow::{Context, Result, bail};
 use anytls::core::PaddingFactory;
 use anytls::proxy::session::{Stream as AnytlsStream, new_server_session};
 use anytls::runtime::DefaultPaddingFactory;
-use anytls::uot::{
-    UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream,
-    uot_get_request_from_stream, uot_is_sentinel_destination,
-};
+use anytls::uot::{UotMode, UotRequest, uot_get_request_from_stream, uot_is_sentinel_destination};
 use aws_lc_rs::agreement;
 use aws_lc_rs::encoding::{AsBigEndian, Curve25519SeedBin};
 use base64::Engine;
@@ -54,7 +51,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream as TokioTcpStream, UdpSocket};
 
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -382,7 +379,7 @@ async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address) -> R
         stream.session_id(),
         stream.id()
     );
-    let mut outbound = match tokio::time::timeout(
+    let outbound = match tokio::time::timeout(
         UPSTREAM_CONNECT_TIMEOUT,
         TokioTcpStream::connect(&dst),
     )
@@ -432,57 +429,7 @@ async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address) -> R
     outbound.set_nodelay(true).ok();
     stream.handshake_success().await?;
 
-    let session_read = stream.clone();
-    let session_write = stream.clone();
-    let (mut up_read, mut up_write) = outbound.split();
-
-    let s2u = async {
-        use tokio::io::AsyncWriteExt;
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            match session_read.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if up_write
-                        .write_all(&buf[..n])
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = up_write.shutdown().await;
-        Ok::<(), std::io::Error>(())
-    };
-
-    let u2s = async {
-        use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            match up_read.read(&mut buf).await {
-                Ok(0) => {
-                    let _ = session_write.close().await;
-                    break;
-                }
-                Ok(n) => {
-                    if session_write
-                        .write(&buf[..n])
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        Ok::<(), std::io::Error>(())
-    };
-
-    let _ = tokio::join!(s2u, u2s);
+    anyreality::relay_tcp(outbound, stream).await?;
     Ok(())
 }
 
@@ -492,35 +439,12 @@ async fn handle_uot_datagram(
 ) -> Result<()> {
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
     stream.handshake_success().await?;
-    let mut buf = vec![0u8; 65_535];
-
-    let result: Result<()> = async {
-        loop {
-            tokio::select! {
-                res = uot_get_packet_from_stream(UotMode::Datagram, reader) => {
-                    let (destination, payload) = res?;
-                    let dst = destination
-                        .ok_or_else(|| anyhow::anyhow!("UoT datagram missing destination"))?;
-                    udp.send_to(&payload, dst.to_string()).await?;
-                }
-                res = udp.recv_from(&mut buf) => {
-                    let (n, source) = res?;
-                    let frame = uot_encode_packet(
-                        UotMode::Datagram,
-                        Some(&Address::from(source)),
-                        &buf[..n],
-                    )?;
-                    stream.write(&frame).await?;
-                }
-            }
-        }
-    }
-    .await;
+    let result = anyreality::relay_uot(&udp, &stream, reader, UotMode::Datagram).await;
 
     if result.is_err() {
         let _ = stream.close().await;
     }
-    result
+    result.map_err(Into::into)
 }
 
 async fn handle_uot_connected(
@@ -538,29 +462,12 @@ async fn handle_uot_connected(
         return Err(err.into());
     }
     stream.handshake_success().await?;
-    let mut buf = vec![0u8; 65_535];
-
-    let result: Result<()> = async {
-        loop {
-            tokio::select! {
-                res = uot_get_packet_from_stream(UotMode::Connected, reader) => {
-                    let (_, payload) = res?;
-                    udp.send(&payload).await?;
-                }
-                res = udp.recv(&mut buf) => {
-                    let n = res?;
-                    let frame = uot_encode_packet(UotMode::Connected, None, &buf[..n])?;
-                    stream.write(&frame).await?;
-                }
-            }
-        }
-    }
-    .await;
+    let result = anyreality::relay_uot(&udp, &stream, reader, UotMode::Connected).await;
 
     if result.is_err() {
         let _ = stream.close().await;
     }
-    result
+    result.map_err(Into::into)
 }
 
 // === helpers ===
@@ -1096,62 +1003,6 @@ fn parse_hex_nibble(value: u8) -> u8 {
 fn is_error_of_session_broken(error: &std::io::Error) -> bool {
     use std::io::ErrorKind::{BrokenPipe, UnexpectedEof};
     matches!(error.kind(), UnexpectedEof | BrokenPipe)
-}
-
-// === AsyncRead adapter for AnytlsSession ===
-
-type ReadFut = Box<dyn core::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>;
-
-struct AnytlsStreamReader {
-    inner: Arc<AnytlsStream>,
-    read_fut: Option<core::pin::Pin<ReadFut>>,
-}
-
-impl AnytlsStreamReader {
-    fn new(inner: Arc<AnytlsStream>) -> Self {
-        Self {
-            inner,
-            read_fut: None,
-        }
-    }
-}
-
-impl AsyncRead for AnytlsStreamReader {
-    fn poll_read(
-        mut self: core::pin::Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> core::task::Poll<std::io::Result<()>> {
-        loop {
-            if let Some(fut) = self.read_fut.as_mut() {
-                match fut.as_mut().poll(cx) {
-                    core::task::Poll::Ready(Ok((v, n))) => {
-                        self.read_fut = None;
-                        buf.put_slice(&v[..n]);
-                        return core::task::Poll::Ready(Ok(()));
-                    }
-                    core::task::Poll::Ready(Err(e)) => {
-                        self.read_fut = None;
-                        return core::task::Poll::Ready(Err(e));
-                    }
-                    core::task::Poll::Pending => return core::task::Poll::Pending,
-                }
-            }
-
-            let remaining = buf.remaining();
-            if remaining == 0 {
-                return core::task::Poll::Ready(Ok(()));
-            }
-
-            let inner = self.inner.clone();
-            self.read_fut = Some(Box::pin(async move {
-                let mut v = vec![0u8; remaining];
-                let n = inner.read(&mut v).await?;
-                v.truncate(n);
-                Ok::<(Vec<u8>, usize), std::io::Error>((v, n))
-            }));
-        }
-    }
 }
 
 #[cfg(test)]
