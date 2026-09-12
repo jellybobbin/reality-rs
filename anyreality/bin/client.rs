@@ -384,7 +384,7 @@ async fn handle_http_connect(mut tcp_stream: TcpStream, client: Arc<Client>) -> 
     };
     tokio::time::timeout(DEFAULT_HTTP_HEADER_TIMEOUT, read_headers)
         .await
-        .context("HTTP proxy header timeout")??;
+        .with_context(|| http_header_timeout_context(&request))??;
 
     let text = std::str::from_utf8(&request).context("HTTP proxy request is not UTF-8")?;
     let request_line = text
@@ -582,6 +582,49 @@ async fn handle_tcp_connect(
     let _ = tokio::join!(l2r, r2l);
     log::trace!("tcp tunnel to {target} closed");
     Ok(())
+}
+
+fn http_header_timeout_context(request: &[u8]) -> String {
+    let prefix = if request.starts_with(b"\x16\x03") {
+        "tls-handshake"
+    } else if request.starts_with(b"CONNECT ") {
+        "http-connect"
+    } else if request
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+    {
+        "ascii-method-or-other"
+    } else if request.is_empty() {
+        "empty"
+    } else {
+        "binary-or-other"
+    };
+    format!(
+        "HTTP proxy header timeout (received_bytes={}, prefix={prefix}, request_line_complete={})",
+        request.len(),
+        request.contains(&b'\n')
+    )
+}
+
+#[cfg(test)]
+mod http_diagnostic_tests {
+    use super::http_header_timeout_context;
+
+    #[test]
+    fn header_timeout_diagnostics_do_not_expose_request_contents() {
+        let request = b"CONNECT private.example:443 HTTP/1.1\r\nProxy-Authorization: secret";
+        let message = http_header_timeout_context(request);
+        assert!(message.contains(&format!("received_bytes={}", request.len())));
+        assert!(message.contains("prefix=http-connect"));
+        assert!(message.contains("request_line_complete=true"));
+        assert!(!message.contains("private.example"));
+        assert!(!message.contains("secret"));
+        assert!(http_header_timeout_context(b"\x16\x03\x01").contains("prefix=tls-handshake"));
+        assert!(http_header_timeout_context(b"GET ").contains("prefix=ascii-method-or-other"));
+        assert!(http_header_timeout_context(b"\x04").contains("prefix=binary-or-other"));
+        assert!(http_header_timeout_context(b"").contains("prefix=empty"));
+        assert!(http_header_timeout_context(b"CONNECT ").contains("request_line_complete=false"));
+    }
 }
 
 async fn finish_logical_stream(stream: &Arc<AnytlsStream>) -> std::io::Result<()> {

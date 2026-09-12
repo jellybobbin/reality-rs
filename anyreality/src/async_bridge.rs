@@ -50,6 +50,18 @@ where
     C: Connection + Send + 'static,
 {
     tls.sock.set_nonblocking(true)?;
+    let tls_eof = pump_io(&handle, &mut tls, duplex)?;
+    if !tls_eof {
+        tls.conn.send_close_notify();
+        let _ = tls.flush();
+    }
+    let _ = tls
+        .sock
+        .shutdown(std::net::Shutdown::Both);
+    Ok(())
+}
+
+fn pump_io<T: Read + Write>(handle: &Handle, tls: &mut T, duplex: DuplexStream) -> Result<bool> {
     let (mut duplex_read, mut duplex_write) = tokio::io::split(duplex);
 
     let mut tls_to_app: Vec<u8> = Vec::with_capacity(PUMP_BUFFER);
@@ -81,17 +93,21 @@ where
         }
 
         if !tls_to_app.is_empty() {
-            let written = handle.block_on(async { duplex_write.write(&tls_to_app).await });
+            let written = handle.block_on(async {
+                tokio::time::timeout(Duration::from_millis(2), duplex_write.write(&tls_to_app))
+                    .await
+            });
             match written {
-                Ok(0) => app_eof = true,
-                Ok(n) => {
+                Ok(Ok(0)) => app_eof = true,
+                Ok(Ok(n)) => {
                     tls_to_app.drain(..n);
                     progressed = true;
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     log::trace!("bridge: duplex write error: {error}");
                     app_eof = true;
                 }
+                Err(_) => {}
             }
         }
 
@@ -133,17 +149,14 @@ where
                     tls_eof = true;
                 }
             }
-            match tls.flush() {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
-            }
+        }
+        match tls.flush() {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
         }
 
         if app_eof && app_to_tls.is_empty() {
-            let _ = tls
-                .sock
-                .shutdown(std::net::Shutdown::Both);
             break;
         }
 
@@ -156,9 +169,133 @@ where
         }
     }
 
-    if !tls_eof {
-        tls.conn.send_close_notify();
-        let _ = tls.flush();
+    Ok(tls_eof)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    struct TestTransport {
+        remaining: usize,
+        written: mpsc::Sender<Vec<u8>>,
     }
-    Ok(())
+
+    impl Read for TestTransport {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let count = buffer.len().min(self.remaining);
+            buffer[..count].fill(42);
+            self.remaining -= count;
+            Ok(count)
+        }
+    }
+
+    impl Write for TestTransport {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.written
+                .send(buffer.to_vec())
+                .unwrap();
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_tls_flush_is_retried_without_new_app_data() {
+        struct BufferedTransport {
+            pending: Vec<u8>,
+            blocked_once: bool,
+            flushed: mpsc::Sender<Vec<u8>>,
+        }
+
+        impl Read for BufferedTransport {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }
+
+        impl Write for BufferedTransport {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                self.pending.extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                if !self.pending.is_empty() {
+                    if !self.blocked_once {
+                        self.blocked_once = true;
+                        return Err(std::io::ErrorKind::WouldBlock.into());
+                    }
+                    self.flushed
+                        .send(core::mem::take(&mut self.pending))
+                        .unwrap();
+                }
+                Ok(())
+            }
+        }
+
+        let (mut app, remote) = tokio::io::duplex(1024);
+        let (flushed, received) = mpsc::channel();
+        let handle = Handle::current();
+        let worker = std::thread::spawn(move || {
+            let mut transport = BufferedTransport {
+                pending: Vec::new(),
+                blocked_once: false,
+                flushed,
+            };
+            pump_io(&handle, &mut transport, remote)
+        });
+        app.write_all(b"pending").await.unwrap();
+        let result = received.recv_timeout(Duration::from_secs(1));
+        drop(app);
+        worker.join().unwrap().unwrap();
+        assert_eq!(
+            result.expect("pending TLS output must be retried without new app data"),
+            b"pending"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_app_reader_does_not_block_outbound_data() {
+        let (mut app, remote) = tokio::io::duplex(1024);
+        let (written, received) = mpsc::channel();
+        let handle = Handle::current();
+        let worker = std::thread::spawn(move || {
+            let mut transport = TestTransport {
+                remaining: PUMP_BUFFER * 2,
+                written,
+            };
+            pump_io(&handle, &mut transport, remote)
+        });
+
+        app.write_all(b"first").await.unwrap();
+        assert_eq!(
+            received
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            b"first"
+        );
+        app.write_all(b"next").await.unwrap();
+        let result = received.recv_timeout(Duration::from_secs(1));
+        let mut buffer = vec![0u8; PUMP_BUFFER * 2];
+        let read_result =
+            tokio::time::timeout(Duration::from_secs(2), app.read_exact(&mut buffer)).await;
+        drop(app);
+        worker.join().unwrap().unwrap();
+        assert_eq!(
+            result.expect("outbound traffic must progress even while the app is not reading"),
+            b"next"
+        );
+        read_result
+            .expect("buffered inbound data must drain after reading resumes")
+            .unwrap();
+        assert!(buffer.iter().all(|byte| *byte == 42));
+    }
 }
