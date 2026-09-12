@@ -341,6 +341,12 @@ async fn handle_connection(
 }
 
 async fn handle_stream(stream: Arc<AnytlsStream>) -> Result<()> {
+    // Acknowledge the stream immediately so the client's SYNACK watchdog is
+    // satisfied within one RTT. SYNACK must not be gated on reading the target
+    // address or dialing upstream: multiplex reader head-of-line delays and
+    // slow upstream connects would otherwise push the SYNACK past the client
+    // deadline and abort an otherwise healthy stream.
+    stream.handshake_success().await?;
     log::debug!(
         "session={} stream={} stage=target_read_start",
         stream.session_id(),
@@ -393,9 +399,8 @@ async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address) -> R
                 stream.id(),
                 started.elapsed().as_millis()
             );
-            stream
-                .handshake_failure(&err.to_string())
-                .await?;
+            // SYNACK was already sent on accept; the upstream is simply dead,
+            // so close the stream instead of emitting a duplicate SYNACK.
             stream.close().await?;
             return Err(err.into());
         }
@@ -413,9 +418,7 @@ async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address) -> R
                 stream.id(),
                 started.elapsed().as_millis()
             );
-            stream
-                .handshake_failure(&err.to_string())
-                .await?;
+            // SYNACK was already sent on accept; just close on timeout.
             stream.close().await?;
             return Err(err.into());
         }
@@ -427,7 +430,6 @@ async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address) -> R
         started.elapsed().as_millis()
     );
     outbound.set_nodelay(true).ok();
-    stream.handshake_success().await?;
 
     anyreality::relay_tcp(outbound, stream).await?;
     Ok(())
@@ -438,7 +440,6 @@ async fn handle_uot_datagram(
     reader: &mut AnytlsStreamReader,
 ) -> Result<()> {
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
-    stream.handshake_success().await?;
     let result = anyreality::relay_uot(&udp, &stream, reader, UotMode::Datagram).await;
 
     if result.is_err() {
@@ -455,13 +456,10 @@ async fn handle_uot_connected(
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
     let dst = request.destination.to_string();
     if let Err(err) = udp.connect(&dst).await {
-        stream
-            .handshake_failure(&err.to_string())
-            .await?;
+        // SYNACK was already sent on accept; close on connect failure.
         stream.close().await?;
         return Err(err.into());
     }
-    stream.handshake_success().await?;
     let result = anyreality::relay_uot(&udp, &stream, reader, UotMode::Connected).await;
 
     if result.is_err() {
