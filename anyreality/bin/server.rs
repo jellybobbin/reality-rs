@@ -255,6 +255,7 @@ async fn handle_connection(
     reality_version: [u8; 3],
 ) -> Result<()> {
     stream.set_nodelay(true).ok();
+    let peer_addr = stream.peer_addr()?;
     let std_stream = stream.into_std()?;
     std_stream.set_nonblocking(false)?;
 
@@ -317,8 +318,10 @@ async fn handle_connection(
         Box::new(bridge),
         Box::new(|session: Arc<AnytlsStream>| {
             tokio::spawn(async move {
+                let session_id = session.session_id();
+                let stream_id = session.id();
                 if let Err(error) = handle_stream(session).await {
-                    log::debug!("stream error: {error:#}");
+                    log::warn!("session={session_id} stream={stream_id} stage=stream_failed reason={error:#}");
                 }
             });
         }),
@@ -327,13 +330,25 @@ async fn handle_connection(
     )
     .await;
 
+    log::debug!(
+        "session={} peer={peer_addr} stage=authenticated_session",
+        session.id
+    );
     if let Err(error) = session.run().await {
-        log::debug!("anytls session ended: {error}");
+        log::debug!(
+            "session={} peer={peer_addr} stage=session_ended reason={error}",
+            session.id
+        );
     }
     Ok(())
 }
 
 async fn handle_stream(stream: Arc<AnytlsStream>) -> Result<()> {
+    log::debug!(
+        "session={} stream={} stage=target_read_start",
+        stream.session_id(),
+        stream.id()
+    );
     let mut reader = AnytlsStreamReader::new(stream.clone());
     let destination = match Address::retrieve_from_async_stream(&mut reader).await {
         Ok(destination) => destination,
@@ -343,6 +358,11 @@ async fn handle_stream(stream: Arc<AnytlsStream>) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
 
+    log::debug!(
+        "session={} stream={} stage=target_read_complete target={destination}",
+        stream.session_id(),
+        stream.id()
+    );
     if uot_is_sentinel_destination(&destination) {
         let request = uot_get_request_from_stream(&mut reader).await?;
         match request.mode {
@@ -356,33 +376,59 @@ async fn handle_stream(stream: Arc<AnytlsStream>) -> Result<()> {
 
 async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address) -> Result<()> {
     let dst = destination.to_string();
-    let mut outbound =
-        match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TokioTcpStream::connect(&dst)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(err)) => {
-                log::debug!("connect upstream {dst} failed: {err}");
-                stream
-                    .handshake_failure(&err.to_string())
-                    .await?;
-                stream.close().await?;
-                return Err(err.into());
-            }
-            Err(_) => {
-                let err = std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "connect upstream {dst} timed out after {}s",
-                        UPSTREAM_CONNECT_TIMEOUT.as_secs()
-                    ),
-                );
-                log::debug!("{err}");
-                stream
-                    .handshake_failure(&err.to_string())
-                    .await?;
-                stream.close().await?;
-                return Err(err.into());
-            }
-        };
+    let started = tokio::time::Instant::now();
+    log::debug!(
+        "session={} stream={} stage=upstream_connect_start target={dst}",
+        stream.session_id(),
+        stream.id()
+    );
+    let mut outbound = match tokio::time::timeout(
+        UPSTREAM_CONNECT_TIMEOUT,
+        TokioTcpStream::connect(&dst),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => {
+            log::debug!(
+                "session={} stream={} stage=upstream_connect_failed elapsed_ms={} target={dst} reason={err}",
+                stream.session_id(),
+                stream.id(),
+                started.elapsed().as_millis()
+            );
+            stream
+                .handshake_failure(&err.to_string())
+                .await?;
+            stream.close().await?;
+            return Err(err.into());
+        }
+        Err(_) => {
+            let err = std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "connect upstream {dst} timed out after {}s",
+                    UPSTREAM_CONNECT_TIMEOUT.as_secs()
+                ),
+            );
+            log::debug!(
+                "session={} stream={} stage=upstream_connect_timeout elapsed_ms={} reason={err}",
+                stream.session_id(),
+                stream.id(),
+                started.elapsed().as_millis()
+            );
+            stream
+                .handshake_failure(&err.to_string())
+                .await?;
+            stream.close().await?;
+            return Err(err.into());
+        }
+    };
+    log::debug!(
+        "session={} stream={} stage=upstream_connect_complete elapsed_ms={}",
+        stream.session_id(),
+        stream.id(),
+        started.elapsed().as_millis()
+    );
     outbound.set_nodelay(true).ok();
     stream.handshake_success().await?;
 

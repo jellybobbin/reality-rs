@@ -223,14 +223,15 @@ async fn main() -> Result<()> {
         let anytls_client = anytls_client.clone();
         let auth = auth.clone();
         tokio::spawn(async move {
-            let mut first_byte = [0u8; 1];
-            let result = match stream.peek(&mut first_byte).await {
-                Ok(0) => Ok(()),
-                Ok(_) if first_byte[0] == 0x05 => {
+            let result = match detect_local_proxy_protocol(&stream).await {
+                Ok(None) => Ok(()),
+                Ok(Some(LocalProxyProtocol::Socks5)) => {
                     handle_socks(IncomingConnection::new(stream, auth), anytls_client).await
                 }
-                Ok(_) => handle_http_connect(stream, anytls_client).await,
-                Err(error) => Err(error.into()),
+                Ok(Some(LocalProxyProtocol::Http)) => {
+                    handle_http_connect(stream, anytls_client).await
+                }
+                Err(error) => Err(error),
             };
             if let Err(error) = result {
                 log::warn!("Proxy peer {peer_addr} failed: {error:#}");
@@ -403,6 +404,12 @@ async fn handle_http_connect(mut tcp_stream: TcpStream, client: Arc<Client>) -> 
     let target = Address::try_from(target).context("invalid HTTP CONNECT target")?;
 
     let session = client.create_stream().await?;
+    log::debug!(
+        "session={} stream={} stage=target_submit protocol=http-connect peer={:?} target={target}",
+        session.session_id(),
+        session.id(),
+        tcp_stream.peer_addr()
+    );
     if let Err(err) = session
         .write(&Vec::<u8>::from(target.clone()))
         .await
@@ -492,6 +499,11 @@ async fn handle_tcp_connect(
 
     // First user payload on this stream: target address in SOCKS5 SocksAddr
     // format. Becomes the data of the first cmdPSH frame.
+    log::debug!(
+        "session={} stream={} stage=target_submit protocol=socks5 target={target}",
+        session.session_id(),
+        session.id()
+    );
     let addr_bytes: Vec<u8> = target.clone().into();
     if let Err(err) = session.write(&addr_bytes).await {
         let _ = session.terminate().await;
@@ -584,6 +596,32 @@ async fn handle_tcp_connect(
     Ok(())
 }
 
+#[derive(Debug, PartialEq)]
+enum LocalProxyProtocol {
+    Socks5,
+    Http,
+}
+
+async fn detect_local_proxy_protocol(stream: &TcpStream) -> Result<Option<LocalProxyProtocol>> {
+    let mut first_byte = [0u8; 1];
+    if stream.peek(&mut first_byte).await? == 0 {
+        return Ok(None);
+    }
+    match first_byte[0] {
+        0x05 => Ok(Some(LocalProxyProtocol::Socks5)),
+        byte if byte.is_ascii_alphabetic() => Ok(Some(LocalProxyProtocol::Http)),
+        0x04 => bail!(
+            "SOCKS4 is not supported; configure this application to use SOCKS5 or HTTP CONNECT"
+        ),
+        0x16 => bail!(
+            "TLS handshake prefix on plaintext proxy port; use HTTP CONNECT or SOCKS5, not an HTTPS proxy"
+        ),
+        byte => bail!(
+            "unsupported local proxy protocol (first_byte=0x{byte:02x}); expected SOCKS5 or HTTP CONNECT"
+        ),
+    }
+}
+
 fn http_header_timeout_context(request: &[u8]) -> String {
     let prefix = if request.starts_with(b"\x16\x03") {
         "tls-handshake"
@@ -608,7 +646,52 @@ fn http_header_timeout_context(request: &[u8]) -> String {
 
 #[cfg(test)]
 mod http_diagnostic_tests {
-    use super::http_header_timeout_context;
+    use super::*;
+
+    #[tokio::test]
+    async fn local_protocol_detection_preserves_supported_prefixes_and_rejects_binary() {
+        for (prefix, expected) in [
+            (0x05, Some(LocalProxyProtocol::Socks5)),
+            (b'C', Some(LocalProxyProtocol::Http)),
+            (0x04, None),
+            (0x16, None),
+            (0x00, None),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let mut sender = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (receiver, _) = listener.accept().await.unwrap();
+            let mut payload = [0u8; 26];
+            payload[0] = prefix;
+            sender
+                .write_all(&payload)
+                .await
+                .unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                detect_local_proxy_protocol(&receiver),
+            )
+            .await
+            .expect("protocol detection must not wait for HTTP headers");
+            if let Some(expected) = expected {
+                assert_eq!(result.unwrap(), Some(expected));
+                let mut byte = [0u8; 1];
+                receiver.peek(&mut byte).await.unwrap();
+                assert_eq!(byte[0], prefix);
+            } else {
+                let message = result.unwrap_err().to_string();
+                assert!(!message.contains("header timeout"));
+                match prefix {
+                    0x04 => assert!(message.starts_with("SOCKS4 is not supported")),
+                    0x16 => assert!(message.starts_with("TLS handshake prefix")),
+                    _ => assert!(message.contains("first_byte=0x00")),
+                }
+            }
+        }
+    }
 
     #[test]
     fn header_timeout_diagnostics_do_not_expose_request_contents() {
@@ -632,14 +715,37 @@ async fn finish_logical_stream(stream: &Arc<AnytlsStream>) -> std::io::Result<()
 }
 
 async fn wait_for_stream_handshake(stream: &Arc<AnytlsStream>) -> std::io::Result<()> {
-    tokio::time::timeout(STREAM_HANDSHAKE_TIMEOUT, stream.wait_for_handshake())
-        .await
-        .map_err(|_| {
-            std::io::Error::new(
+    let started = tokio::time::Instant::now();
+    log::debug!(
+        "session={} stream={} stage=handshake_wait",
+        stream.session_id(),
+        stream.id()
+    );
+    let result =
+        match tokio::time::timeout(STREAM_HANDSHAKE_TIMEOUT, stream.wait_for_handshake()).await {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!("timed out waiting for SYNACK on stream {}", stream.id()),
-            )
-        })?
+                "timed out waiting for SYNACK",
+            )),
+        };
+    log::debug!(
+        "session={} stream={} stage=handshake_complete elapsed_ms={} result={result:?}",
+        stream.session_id(),
+        stream.id(),
+        started.elapsed().as_millis()
+    );
+    result.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "{error} (session={}, stream={}, elapsed_ms={})",
+                stream.session_id(),
+                stream.id(),
+                started.elapsed().as_millis()
+            ),
+        )
+    })
 }
 
 fn is_nonfatal_local_disconnect(error: &std::io::Error) -> bool {
@@ -683,6 +789,11 @@ async fn handle_udp_associate(
 
     // Mark this stream as a UoT stream:
     //   sentinel address (SocksAddr) + UotRequest{Datagram, unspecified}
+    log::debug!(
+        "session={} stream={} stage=target_submit protocol=uot",
+        session.session_id(),
+        session.id()
+    );
     if let Err(err) = setup_uot_request(&session).await {
         let _ = session.terminate().await;
         let mut reply = associate_req
