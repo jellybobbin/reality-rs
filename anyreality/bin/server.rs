@@ -584,7 +584,16 @@ fn is_reality_client_hello(
         }
         let available = match tcp_stream.peek(&mut buf) {
             Ok(available) => available,
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+            // A SO_RCVTIMEO timeout surfaces as TimedOut or WouldBlock (EAGAIN
+            // on Linux); both mean "no data yet", so keep waiting until the
+            // deadline instead of failing an otherwise valid slow client.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::TimedOut
+                    || error.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
             Err(error) => return Err(error).context("peek ClientHello"),
         };
         if available == 0 {
@@ -897,7 +906,14 @@ async fn handle_raw_tls_fallback(
                 }
                 let available = match tcp_client.peek(&mut buffer) {
                     Ok(available) => available,
-                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => 0,
+                    // Timeout on a slow client shows up as TimedOut or
+                    // WouldBlock (EAGAIN on Linux); keep waiting either way.
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::TimedOut
+                            || error.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        0
+                    }
                     Err(error) => return Err(error.into()),
                 };
                 let Some(handshake) = collect_client_hello(&buffer[..available])? else {
