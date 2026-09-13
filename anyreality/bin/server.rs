@@ -256,12 +256,23 @@ async fn handle_connection(
     let std_stream = stream.into_std()?;
     std_stream.set_nonblocking(false)?;
 
-    let is_reality = is_reality_client_hello(
-        &std_stream,
-        reality_private_key.as_slice(),
-        reality_short_id.as_slice(),
-        &reality_version,
-    )?;
+    // ClientHello sniffing performs blocking socket reads for up to
+    // CLIENT_HELLO_TIMEOUT. Run it on the blocking pool so a slow or probing
+    // connection can never pin an async worker thread; otherwise a handful of
+    // scanners on this port would freeze every live carrier's SYNACK traffic.
+    let detect_key = reality_private_key.clone();
+    let detect_short_id = reality_short_id.clone();
+    let (is_reality, std_stream) =
+        tokio::task::spawn_blocking(move || -> Result<(bool, std::net::TcpStream)> {
+            let is_reality = is_reality_client_hello(
+                &std_stream,
+                detect_key.as_slice(),
+                detect_short_id.as_slice(),
+                &reality_version,
+            )?;
+            Ok((is_reality, std_stream))
+        })
+        .await??;
     if !is_reality {
         return handle_raw_tls_fallback(std_stream, allowed_server_names).await;
     }
@@ -873,32 +884,40 @@ async fn handle_raw_tls_fallback(
     tcp_client: std::net::TcpStream,
     allowed_server_names: Arc<Vec<String>>,
 ) -> Result<()> {
-    tcp_client.set_read_timeout(Some(Duration::from_secs(1)))?;
-    let mut buffer = vec![0u8; 2048];
-    let deadline = Instant::now() + CLIENT_HELLO_TIMEOUT;
-    let handshake = loop {
-        if Instant::now() >= deadline {
-            bail!("timed out waiting for fallback ClientHello");
-        }
-        let available = match tcp_client.peek(&mut buffer) {
-            Ok(available) => available,
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => 0,
-            Err(error) => return Err(error.into()),
-        };
-        let Some(handshake) = collect_client_hello(&buffer[..available])? else {
-            if buffer.len() == CLIENT_HELLO_MAX_WIRE_SIZE {
-                bail!("ClientHello exceeds maximum size");
-            }
-            buffer.resize((buffer.len() * 2).min(CLIENT_HELLO_MAX_WIRE_SIZE), 0);
-            thread::sleep(Duration::from_millis(1));
-            continue;
-        };
-        break handshake;
-    };
-    let parsed = parse_client_hello(&handshake)?;
-    let server_name = parsed
-        .server_name
-        .ok_or_else(|| anyhow::anyhow!("fallback requires SNI"))?;
+    // The SNI sniff also does blocking reads for up to CLIENT_HELLO_TIMEOUT;
+    // keep it on the blocking pool so it never occupies an async worker thread.
+    let (server_name, tcp_client) =
+        tokio::task::spawn_blocking(move || -> Result<(String, std::net::TcpStream)> {
+            tcp_client.set_read_timeout(Some(Duration::from_secs(1)))?;
+            let mut buffer = vec![0u8; 2048];
+            let deadline = Instant::now() + CLIENT_HELLO_TIMEOUT;
+            let handshake = loop {
+                if Instant::now() >= deadline {
+                    bail!("timed out waiting for fallback ClientHello");
+                }
+                let available = match tcp_client.peek(&mut buffer) {
+                    Ok(available) => available,
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => 0,
+                    Err(error) => return Err(error.into()),
+                };
+                let Some(handshake) = collect_client_hello(&buffer[..available])? else {
+                    if buffer.len() == CLIENT_HELLO_MAX_WIRE_SIZE {
+                        bail!("ClientHello exceeds maximum size");
+                    }
+                    buffer.resize((buffer.len() * 2).min(CLIENT_HELLO_MAX_WIRE_SIZE), 0);
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                };
+                break handshake;
+            };
+            let parsed = parse_client_hello(&handshake)?;
+            let server_name = parsed
+                .server_name
+                .ok_or_else(|| anyhow::anyhow!("fallback requires SNI"))?;
+            Ok((server_name, tcp_client))
+        })
+        .await??;
+
     if !allowed_server_names
         .iter()
         .any(|allowed| allowed == &server_name)
