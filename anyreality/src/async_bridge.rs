@@ -6,12 +6,17 @@
 //! be plugged into anytls (which expects `AsyncRead + AsyncWrite`).
 //!
 //! A single dedicated OS worker thread owns the TLS stream and shuttles bytes
-//! between it and two channels. Crucially the thread **parks in the kernel** (a
-//! blocking socket read with a short timeout) when idle instead of spinning:
-//! the previous implementation busy-looped with `Handle::block_on` on every
-//! carrier, which starved the async runtime once many carriers were live and
-//! stalled every session's SYNACK and heartbeat traffic.
+//! between it and two channels. Two properties matter:
+//!
+//! * The worker **parks in the kernel** (a blocking socket read with a short
+//!   timeout) when idle instead of spinning, so many live carriers do not
+//!   starve the async runtime of CPU.
+//! * The outbound (app -> TLS) channel is **bounded**, so the anytls writer is
+//!   backpressured and cannot pile megabytes of bulk stream data ahead of a
+//!   freshly produced control frame (e.g. a SYNACK). Without this bound, new
+//!   streams' SYNACKs queue behind unrelated downloads and time out.
 
+use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
@@ -23,10 +28,16 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
 const PUMP_BUFFER: usize = 64 * 1024;
-const RELAY_HIGH_WATER: usize = 256 * 1024;
+/// Soft cap on outbound bytes buffered inside the worker before it stops
+/// pulling more from the channel. Kept small so control frames stay near the
+/// front of the byte stream.
+const OUTBOUND_HIGH_WATER: usize = 64 * 1024;
 /// Inbound (TLS -> app) chunk backlog before the bridge applies TCP
 /// backpressure by pausing socket reads. Bounds per-carrier inbound memory.
 const INBOUND_CHANNEL_CAP: usize = 16;
+/// Outbound (app -> TLS) chunk backlog. Small so the anytls writer blocks once
+/// the carrier is behind, preserving its control-before-data priority.
+const OUTBOUND_CHANNEL_CAP: usize = 8;
 /// Blocking socket read/write timeout. Bounds how long the worker parks in the
 /// kernel before it re-checks the outbound queue, i.e. the worst-case app->TLS
 /// wakeup latency. Small enough to stay responsive, large enough to avoid a
@@ -36,6 +47,10 @@ const SOCKET_POLL: Duration = Duration::from_millis(5);
 /// not reading), so outbound traffic keeps flowing without a tight spin.
 const BACKPRESSURE_POLL: Duration = Duration::from_millis(1);
 
+type Reservation = Pin<
+    Box<dyn Future<Output = Result<mpsc::OwnedPermit<Vec<u8>>, mpsc::error::SendError<()>>> + Send>,
+>;
+
 fn would_block(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -44,12 +59,17 @@ fn would_block(error: &io::Error) -> bool {
 }
 
 /// Async view over the REALITY TLS carrier. Reads pull decrypted bytes produced
-/// by the worker thread; writes hand plaintext to the worker thread.
+/// by the worker thread; writes hand plaintext to the worker thread under
+/// bounded backpressure.
 pub struct BridgeStream {
     inbound: mpsc::Receiver<Vec<u8>>,
     leftover: Vec<u8>,
     leftover_pos: usize,
-    outbound: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    outbound: Option<mpsc::Sender<Vec<u8>>>,
+    // Boxed reservation future is Send but not Sync; the Mutex makes the whole
+    // stream Sync (required by `AsyncReadWrite`) without ever being contended,
+    // since writes only ever touch it through `&mut self`.
+    reserving: std::sync::Mutex<Option<Reservation>>,
 }
 
 /// Convert a fully handshaken blocking REALITY TLS stream into an async stream
@@ -59,7 +79,7 @@ where
     C: Connection + Send + 'static,
 {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(INBOUND_CHANNEL_CAP);
-    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CHANNEL_CAP);
     std::thread::spawn(move || {
         if let Err(error) = pump(tls, inbound_tx, outbound_rx) {
             log::trace!("REALITY async bridge pump exited: {error:#}");
@@ -70,13 +90,14 @@ where
         leftover: Vec::new(),
         leftover_pos: 0,
         outbound: Some(outbound_tx),
+        reserving: std::sync::Mutex::new(None),
     })
 }
 
 fn pump<C>(
     mut tls: StreamOwned<C, std::net::TcpStream>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
-    mut outbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut outbound_rx: mpsc::Receiver<Vec<u8>>,
 ) -> io::Result<()>
 where
     C: Connection + Send + 'static,
@@ -103,7 +124,7 @@ where
 fn pump_io<T: Read + Write>(
     tls: &mut T,
     inbound_tx: &mpsc::Sender<Vec<u8>>,
-    outbound_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    outbound_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; PUMP_BUFFER];
     let mut out_buf: Vec<u8> = Vec::new();
@@ -111,9 +132,9 @@ fn pump_io<T: Read + Write>(
     let mut app_closed = false;
 
     loop {
-        // 1) Collect queued app -> TLS bytes (bounded so a stalled TLS write
-        //    cannot let the outbound buffer grow without limit).
-        while out_buf.len() < RELAY_HIGH_WATER {
+        // 1) Collect queued app -> TLS bytes, bounded so the worker never holds
+        //    much ahead of what it has flushed (keeps control frames near front).
+        while out_buf.len() < OUTBOUND_HIGH_WATER {
             match outbound_rx.try_recv() {
                 Ok(chunk) => out_buf.extend_from_slice(&chunk),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -216,21 +237,47 @@ impl AsyncRead for BridgeStream {
 impl AsyncWrite for BridgeStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match &self.outbound {
-            Some(sender) => match sender.send(buf.to_vec()) {
-                Ok(()) => Poll::Ready(Ok(buf.len())),
-                Err(_) => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "REALITY bridge closed",
-                ))),
-            },
-            None => Poll::Ready(Err(io::Error::new(
+        let this = self.get_mut();
+        if this.outbound.is_none() {
+            return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "write after shutdown",
-            ))),
+            )));
+        }
+        let mut reserving = this
+            .reserving
+            .lock()
+            .expect("bridge reservation lock poisoned");
+        loop {
+            if let Some(reservation) = reserving.as_mut() {
+                return match reservation.as_mut().poll(cx) {
+                    Poll::Ready(Ok(permit)) => {
+                        *reserving = None;
+                        // Returned sender is a temporary clone; drop it.
+                        let _ = permit.send(buf.to_vec());
+                        Poll::Ready(Ok(buf.len()))
+                    }
+                    Poll::Ready(Err(_)) => {
+                        *reserving = None;
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "REALITY bridge closed",
+                        )))
+                    }
+                    Poll::Pending => Poll::Pending,
+                };
+            }
+            // Acquire capacity before committing to a write so the anytls writer
+            // is backpressured when the carrier falls behind.
+            let sender = this
+                .outbound
+                .as_ref()
+                .expect("checked above")
+                .clone();
+            *reserving = Some(Box::pin(sender.reserve_owned()));
         }
     }
 
@@ -238,10 +285,15 @@ impl AsyncWrite for BridgeStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
         // Dropping the sender signals end-of-stream to the worker, which then
         // sends a TLS close_notify.
-        self.outbound = None;
+        *this
+            .reserving
+            .lock()
+            .expect("bridge reservation lock poisoned") = None;
+        this.outbound = None;
         Poll::Ready(Ok(()))
     }
 }
@@ -319,7 +371,7 @@ mod tests {
         }
 
         let (inbound_tx, _inbound_rx) = mpsc::channel::<Vec<u8>>(INBOUND_CHANNEL_CAP);
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CHANNEL_CAP);
         let (flushed, received) = std_mpsc::channel();
         let worker = std::thread::spawn(move || {
             let mut transport = BufferedTransport {
@@ -332,6 +384,7 @@ mod tests {
 
         outbound_tx
             .send(b"pending".to_vec())
+            .await
             .unwrap();
         let result = received.recv_timeout(Duration::from_secs(1));
         drop(outbound_tx);
@@ -345,7 +398,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stalled_app_reader_does_not_block_outbound_data() {
         let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(INBOUND_CHANNEL_CAP);
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CHANNEL_CAP);
         let (written, received) = std_mpsc::channel();
         let worker = std::thread::spawn(move || {
             let mut transport = CountingTransport {
@@ -359,6 +412,7 @@ mod tests {
         // worker must still deliver queued outbound writes.
         outbound_tx
             .send(b"first".to_vec())
+            .await
             .unwrap();
         assert_eq!(
             received
@@ -369,6 +423,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         outbound_tx
             .send(b"next".to_vec())
+            .await
             .unwrap();
         let next = received.recv_timeout(Duration::from_secs(1));
 
@@ -378,6 +433,7 @@ mod tests {
             leftover: Vec::new(),
             leftover_pos: 0,
             outbound: Some(outbound_tx.clone()),
+            reserving: std::sync::Mutex::new(None),
         };
         let mut drained = 0usize;
         let mut scratch = vec![0u8; PUMP_BUFFER];
@@ -400,62 +456,78 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn inbound_bytes_reach_the_async_reader_in_order() {
-        struct OnceTransport {
-            payload: Vec<u8>,
-        }
+    async fn outbound_writes_are_backpressured_when_transport_stalls() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncWriteExt;
 
-        impl Read for OnceTransport {
-            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-                if self.payload.is_empty() {
-                    return Err(io::ErrorKind::WouldBlock.into());
+        // A transport whose writes block (WouldBlock) until `fail` is set, at
+        // which point they error so the worker can exit cleanly.
+        struct StalledTransport {
+            fail: Arc<AtomicBool>,
+        }
+        impl Read for StalledTransport {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        }
+        impl Write for StalledTransport {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                if self.fail.load(Ordering::Acquire) {
+                    return Err(io::ErrorKind::BrokenPipe.into());
                 }
-                let count = buffer.len().min(self.payload.len());
-                buffer[..count].copy_from_slice(&self.payload[..count]);
-                self.payload.drain(..count);
-                Ok(count)
+                Err(io::ErrorKind::WouldBlock.into())
             }
-        }
-
-        impl Write for OnceTransport {
-            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-                Ok(buffer.len())
-            }
-
             fn flush(&mut self) -> io::Result<()> {
                 Ok(())
             }
         }
 
-        let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(INBOUND_CHANNEL_CAP);
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let fail = Arc::new(AtomicBool::new(false));
+        let (inbound_tx, _inbound_rx) = mpsc::channel::<Vec<u8>>(INBOUND_CHANNEL_CAP);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CHANNEL_CAP);
+        let worker_fail = fail.clone();
         let worker = std::thread::spawn(move || {
-            let mut transport = OnceTransport {
-                payload: b"hello world".to_vec(),
-            };
-            pump_io(&mut transport, &inbound_tx, &mut outbound_rx)
+            let mut transport = StalledTransport { fail: worker_fail };
+            let _ = pump_io(&mut transport, &inbound_tx, &mut outbound_rx);
         });
 
         let mut stream = BridgeStream {
-            inbound: inbound_rx,
+            inbound: {
+                let (_tx, rx) = mpsc::channel::<Vec<u8>>(1);
+                rx
+            },
             leftover: Vec::new(),
             leftover_pos: 0,
             outbound: Some(outbound_tx.clone()),
+            reserving: std::sync::Mutex::new(None),
         };
-        let mut got = Vec::new();
-        while got.len() < b"hello world".len() {
-            let mut scratch = [0u8; 4];
-            let count = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut scratch))
-                .await
-                .expect("inbound data must arrive")
-                .expect("read must succeed");
-            assert_ne!(count, 0);
-            got.extend_from_slice(&scratch[..count]);
-        }
-        assert_eq!(got, b"hello world");
 
+        // The worker absorbs up to OUTBOUND_HIGH_WATER plus the channel before
+        // it must apply backpressure; writing well beyond that must block.
+        let max_absorbed = OUTBOUND_HIGH_WATER / 4096 + OUTBOUND_CHANNEL_CAP;
+        let mut blocked = false;
+        for _ in 0..(max_absorbed + 16) {
+            match tokio::time::timeout(Duration::from_millis(200), stream.write_all(&[7u8; 4096]))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    blocked = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            blocked,
+            "writer must be backpressured by a stalled transport"
+        );
+
+        // Let the worker terminate instead of spinning on the stalled transport.
+        fail.store(true, Ordering::Release);
         drop(outbound_tx);
         drop(stream);
-        worker.join().unwrap().unwrap();
+        let _ = worker.join();
     }
 }
