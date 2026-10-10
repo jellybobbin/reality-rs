@@ -15,8 +15,8 @@ path = "bin/server.rs"
 [dependencies]
 aes-gcm = "0.11.1"
 anyhow = { workspace = true }
-anytls = { version = "0.4.5", default-features = false, features = [
-    "core",
+anytls = { version = "0.4.9", default-features = false, features = [
+    "panel-sync",
     "uot",
     "runtime",
     "client",
@@ -30,7 +30,7 @@ clap = { workspace = true }
 env_logger = { workspace = true }
 hkdf = "0.13.0"
 log = { workspace = true }
-rustls = { path = "../rustls", features = ["log"] }
+rustls = { path = "../rustls", features = ["tracing"] }
 rustls-aws-lc-rs = { path = "../rustls-aws-lc-rs" }
 rustls-util = { path = "../rustls-util" }
 serde = { workspace = true }
