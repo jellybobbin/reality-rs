@@ -1,4 +1,5 @@
 pub mod async_bridge;
+pub mod panel_sync;
 
 use anytls::Stream as AnytlsStream;
 use std::sync::Arc;

@@ -23,8 +23,8 @@ use anyreality::async_bridge;
 
 use anyhow::{Context, Result, bail};
 use anytls::{
-    DEFAULT_SCHEME, PaddingFactory, Session, Stream as AnytlsStream, UotMode, UotRequest, uot_get_request_from_stream,
-    uot_is_sentinel_destination,
+    DEFAULT_SCHEME, PaddingFactory, PanelSyncConfig, Session, Stream as AnytlsStream, UotMode, UotRequest, extract_client_id_from_padding,
+    uot_get_request_from_stream, uot_is_sentinel_destination,
 };
 use aws_lc_rs::agreement;
 use aws_lc_rs::encoding::{AsBigEndian, Curve25519SeedBin};
@@ -52,6 +52,9 @@ use std::thread;
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream as TokioTcpStream, UdpSocket};
+use uuid::Uuid;
+
+use anyreality::panel_sync::PanelSync;
 
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_HELLO_MAX_WIRE_SIZE: usize = 128 * 1024;
@@ -90,6 +93,8 @@ struct ServerConfigFile {
     anytls: Option<ServerAnytlsConfigFile>,
     #[serde(default)]
     server: Option<ServerRuntimeConfigFile>,
+    #[serde(default)]
+    panel_sync: Option<PanelSyncConfig>,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
@@ -127,6 +132,7 @@ struct ServerConfigResolved {
     short_ids: Vec<Vec<u8>>,
     version: String,
     server_names: Vec<String>,
+    panel_sync: Option<PanelSyncConfig>,
 }
 
 #[derive(Debug)]
@@ -197,6 +203,7 @@ async fn main() -> Result<()> {
     let tls_config = Arc::new(tls_config);
     let allowed_server_names = Arc::new(resolved.server_names.clone());
     let password_sha256: [u8; 32] = Sha256::digest(resolved.password.as_bytes()).into();
+    let panel_sync = PanelSync::start(resolved.panel_sync).await.context("start panel synchronization")?;
     let padding = Arc::new(tokio::sync::RwLock::new(
         PaddingFactory::new(DEFAULT_SCHEME).expect("valid default padding scheme"),
     ));
@@ -213,6 +220,7 @@ async fn main() -> Result<()> {
         let padding = padding.clone();
         let reality_probe_verifier = reality_probe_verifier.clone();
         let stream_slots = stream_slots.clone();
+        let panel_sync = panel_sync.clone();
         tokio::spawn(async move {
             let _carrier_permit = carrier_permit;
             if let Err(error) = handle_connection(
@@ -223,6 +231,7 @@ async fn main() -> Result<()> {
                 password_sha256,
                 padding,
                 stream_slots,
+                panel_sync,
             )
             .await
             {
@@ -240,6 +249,7 @@ async fn handle_connection(
     password_sha256: [u8; 32],
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
     stream_slots: Arc<tokio::sync::Semaphore>,
+    panel_sync: PanelSync,
 ) -> Result<()> {
     stream.set_nodelay(true).ok();
     let peer_addr = stream.peer_addr()?;
@@ -329,12 +339,13 @@ async fn handle_connection(
         log::debug!("anytls auth failed for an inbound REALITY peer");
         return Ok(());
     }
-    if padding_buf.len() >= 36
-        && let Some(client_id) = std::str::from_utf8(&padding_buf[..36])
-            .ok()
-            .and_then(|value| uuid::Uuid::parse_str(value).ok())
-    {
+    let client_id = extract_client_id_from_padding(&padding_buf);
+    if let Some(client_id) = client_id {
         log::info!("anytls client id: {client_id}");
+    }
+    if !panel_sync.authorizes(client_id).await {
+        log::debug!("session peer={peer_addr} denied panel-managed client {client_id:?}");
+        return Ok(());
     }
 
     // 4) Hand the carrier to anytls and run the session loop.
@@ -362,10 +373,11 @@ async fn handle_connection(
                     }
                     continue;
                 };
+                let panel_sync = panel_sync.clone();
                 tokio::spawn(async move {
                     let _stream_permit = stream_permit;
                     let stream_id = stream.id();
-                    if let Err(error) = handle_stream(stream).await {
+                    if let Err(error) = handle_stream(stream, panel_sync, client_id).await {
                         log::warn!("session={session_id} stream={stream_id} stage=stream_failed reason={error:#}");
                     }
                 });
@@ -382,11 +394,16 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn handle_stream(stream: AnytlsStream) -> Result<()> {
+async fn handle_stream(stream: AnytlsStream, panel_sync: PanelSync, client_id: Option<Uuid>) -> Result<()> {
     let mut io = anytls::StreamIo::new(stream);
     let stream = io.stream();
     let session_id = stream.session_id();
     let stream_id = stream.id();
+    if !panel_sync.authorizes(client_id).await {
+        log::debug!("session={session_id} stream={stream_id} denied disabled panel-managed client {client_id:?}");
+        stream.shutdown_write_by_send_fin_to_remote().await?;
+        return Ok(());
+    }
     // Acknowledge the stream immediately so the client's SYNACK watchdog is
     // satisfied within one RTT. SYNACK must not be gated on reading the target
     // address or dialing upstream: multiplex reader head-of-line delays and
@@ -420,15 +437,21 @@ async fn handle_stream(stream: AnytlsStream) -> Result<()> {
             Err(error) => return Err(error.into()),
         };
         match request.mode {
-            UotMode::Connected => handle_uot_connected(stream, &mut io, &request).await,
-            UotMode::Datagram => handle_uot_datagram(stream, &mut io).await,
+            UotMode::Connected => handle_uot_connected(stream, &mut io, &request, panel_sync, client_id).await,
+            UotMode::Datagram => handle_uot_datagram(stream, &mut io, panel_sync, client_id).await,
         }
     } else {
-        handle_tcp_stream(&mut io, &stream, destination).await
+        handle_tcp_stream(&mut io, &stream, destination, panel_sync, client_id).await
     }
 }
 
-async fn handle_tcp_stream(io: &mut anytls::StreamIo, stream: &Arc<AnytlsStream>, destination: Address) -> Result<()> {
+async fn handle_tcp_stream(
+    io: &mut anytls::StreamIo,
+    stream: &Arc<AnytlsStream>,
+    destination: Address,
+    panel_sync: PanelSync,
+    client_id: Option<Uuid>,
+) -> Result<()> {
     let session_id = stream.session_id();
     let stream_id = stream.id();
 
@@ -467,7 +490,8 @@ async fn handle_tcp_stream(io: &mut anytls::StreamIo, stream: &Arc<AnytlsStream>
     );
     outbound.set_nodelay(true).ok();
 
-    match anytls::relay::copy_bidirectional(io, &mut outbound).await {
+    let relay_result = panel_sync.relay_tcp(io, &mut outbound, client_id).await;
+    match relay_result {
         Ok(_) => {}
         Err(error) if error.is_peer_disconnect() => {
             log::debug!("session={session_id} stream={stream_id} peer disconnected during TCP relay to {dst}: {error}",);
@@ -477,12 +501,17 @@ async fn handle_tcp_stream(io: &mut anytls::StreamIo, stream: &Arc<AnytlsStream>
     Ok(())
 }
 
-async fn handle_uot_datagram(stream: Arc<AnytlsStream>, reader: &mut anytls::StreamIo) -> Result<()> {
+async fn handle_uot_datagram(
+    stream: Arc<AnytlsStream>,
+    reader: &mut anytls::StreamIo,
+    panel_sync: PanelSync,
+    client_id: Option<Uuid>,
+) -> Result<()> {
     let session_id = stream.session_id();
     let stream_id = stream.id();
 
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
-    let result = anyreality::relay_uot_with_peer_identity(&udp, &stream, reader, UotMode::Datagram).await;
+    let result = panel_sync.relay_uot(&udp, &stream, reader, UotMode::Datagram, client_id).await;
 
     if result.is_err() {
         let _ = stream.shutdown_write_by_send_fin_to_remote().await;
@@ -497,7 +526,13 @@ async fn handle_uot_datagram(stream: Arc<AnytlsStream>, reader: &mut anytls::Str
     }
 }
 
-async fn handle_uot_connected(stream: Arc<AnytlsStream>, reader: &mut anytls::StreamIo, request: &UotRequest) -> Result<()> {
+async fn handle_uot_connected(
+    stream: Arc<AnytlsStream>,
+    reader: &mut anytls::StreamIo,
+    request: &UotRequest,
+    panel_sync: PanelSync,
+    client_id: Option<Uuid>,
+) -> Result<()> {
     let session_id = stream.session_id();
     let stream_id = stream.id();
 
@@ -508,7 +543,7 @@ async fn handle_uot_connected(stream: Arc<AnytlsStream>, reader: &mut anytls::St
         stream.shutdown_write_by_send_fin_to_remote().await?;
         return Err(err.into());
     }
-    let result = anyreality::relay_uot_with_peer_identity(&udp, &stream, reader, UotMode::Connected).await;
+    let result = panel_sync.relay_uot(&udp, &stream, reader, UotMode::Connected, client_id).await;
 
     if result.is_err() {
         let _ = stream.shutdown_write_by_send_fin_to_remote().await;
@@ -573,6 +608,7 @@ fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
         short_ids,
         version,
         server_names,
+        panel_sync: PanelSync::resolve_config(file_config.panel_sync)?,
     })
 }
 
@@ -851,7 +887,7 @@ fn is_error_of_session_broken(error: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerRealityConfigFile, parse_server_short_ids, probe_server_hello};
+    use super::{PanelSync, ServerConfigFile, ServerRealityConfigFile, parse_server_short_ids, probe_server_hello};
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -886,6 +922,33 @@ mod tests {
 
         let invalid_hex: ServerRealityConfigFile = toml::from_str("shortIds = [\"zz\"]").unwrap();
         assert!(parse_server_short_ids(&invalid_hex).is_err());
+    }
+
+    #[test]
+    fn panel_sync_config_uses_anytls_schema_and_rejects_partial_settings() {
+        let toml: ServerConfigFile = toml::from_str(
+            r#"
+    [panelSync]
+webapi_url = "https://panel.example/api"
+webapi_token = "secret"
+node_id = 7
+update_interval_secs = 12
+"#,
+        )
+        .unwrap();
+        let resolved = PanelSync::resolve_config(toml.panel_sync).unwrap().unwrap();
+        assert_eq!(resolved.webapi_url.unwrap().as_str(), "https://panel.example/api");
+        assert_eq!(resolved.node_id, Some(7));
+        assert_eq!(resolved.update_interval_secs, Some(12));
+
+        let json: ServerConfigFile =
+            serde_json::from_str(r#"{"panelSync":{"webapi_url":"https://panel.example/api","webapi_token":"secret","node_id":7}}"#)
+                .unwrap();
+        assert!(PanelSync::resolve_config(json.panel_sync).unwrap().is_some());
+
+        let partial: ServerConfigFile = toml::from_str("[panelSync]\nwebapi_url = \"https://panel.example/api\"").unwrap();
+        assert!(PanelSync::resolve_config(partial.panel_sync).is_err());
+        assert!(PanelSync::resolve_config(None).unwrap().is_none());
     }
 
     #[test]

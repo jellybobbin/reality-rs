@@ -163,6 +163,22 @@ The sample server config uses three top-level sections:
 The binary now reads runtime values from the config file. The CLI only takes
 `--config` and `--log`.
 
+Panel synchronization is optional. Add a `panelSync` section to either config
+format, using the `PanelSyncConfig` field names:
+
+```toml
+[panelSync]
+webapi_url = "https://panel.example/api"
+webapi_token = "your-token"
+node_id = 7
+update_interval_secs = 60
+```
+
+The URL, token, and node ID are required together; the update interval is
+optional and has a 60-second default (minimum 5 seconds). When enabled, the
+server synchronizes managed client UUIDs, rejects missing or disabled clients,
+and reports per-client TCP and UoT traffic to the panel.
+
 For authenticated REALITY connections, the server samples a ServerHello from
 the ClientHello SNI on port 443 only when the name is in `reality.serverNames`.
 Missing or unlisted SNI disables sampling. The server sends the received
