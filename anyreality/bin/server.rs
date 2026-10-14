@@ -63,7 +63,6 @@ const REALITY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const ANYTLS_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_INBOUND_CARRIERS: usize = 128;
 const MAX_ACTIVE_STREAMS: usize = 512;
-const DEFAULT_MAX_STREAMS_PER_SESSION: usize = 128;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_SESSION_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
@@ -353,7 +352,6 @@ async fn handle_connection(
         NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         Box::new(bridge),
         padding,
-        DEFAULT_MAX_STREAMS_PER_SESSION,
         anytls::DEFAULT_MAX_SESSION_AGE,
     );
     let session_id = session.id();
@@ -671,7 +669,7 @@ fn is_reality_client_hello(
 
         let Some(client_hello) = RealityClientHelloProbe::from_tls_records(&buf[..available])? else {
             if buf.len() == CLIENT_HELLO_MAX_WIRE_SIZE {
-                bail!("ClientHello exceeds maximum size")
+                bail!("ClientHello incomplete at maximum buffer size")
             }
             buf.resize((buf.len() * 2).min(CLIENT_HELLO_MAX_WIRE_SIZE), 0);
             thread::sleep(Duration::from_millis(1));
@@ -689,12 +687,22 @@ fn is_reality_client_hello(
 fn probe_server_hello(destination: &str, client_hello: &[u8]) -> std::io::Result<Vec<u8>> {
     use std::io::{Error, ErrorKind::InvalidData, ErrorKind::InvalidInput};
     let mut last_error = None;
+    let deadline = Instant::now() + SERVER_HELLO_PROBE_TIMEOUT;
     use std::net::ToSocketAddrs;
     for address in destination.to_socket_addrs()? {
-        match std::net::TcpStream::connect_timeout(&address, SERVER_HELLO_PROBE_TIMEOUT) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            last_error = Some(Error::new(std::io::ErrorKind::TimedOut, "ServerHello probe timed out"));
+            break;
+        }
+        match std::net::TcpStream::connect_timeout(&address, remaining) {
             Ok(mut stream) => {
-                stream.set_read_timeout(Some(SERVER_HELLO_PROBE_TIMEOUT))?;
-                stream.set_write_timeout(Some(SERVER_HELLO_PROBE_TIMEOUT))?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(Error::new(std::io::ErrorKind::TimedOut, "ServerHello probe timed out"));
+                }
+                stream.set_read_timeout(Some(remaining))?;
+                stream.set_write_timeout(Some(remaining))?;
                 stream.write_all(client_hello)?;
 
                 let mut record_header = [0u8; 5];
@@ -758,6 +766,7 @@ async fn handle_raw_tls_fallback(tcp_client: std::net::TcpStream, allowed_server
                 bail!("timed out waiting for fallback ClientHello");
             }
             let available = match tcp_client.peek(&mut buffer) {
+                Ok(0) => bail!("connection closed before fallback ClientHello"),
                 Ok(available) => available,
                 // Timeout on a slow client shows up as TimedOut or
                 // WouldBlock (EAGAIN on Linux); keep waiting either way.
@@ -766,7 +775,7 @@ async fn handle_raw_tls_fallback(tcp_client: std::net::TcpStream, allowed_server
             };
             let Some(client_hello) = RealityClientHelloProbe::from_tls_records(&buffer[..available])? else {
                 if buffer.len() == CLIENT_HELLO_MAX_WIRE_SIZE {
-                    bail!("ClientHello exceeds maximum size");
+                    bail!("ClientHello incomplete at maximum buffer size");
                 }
                 buffer.resize((buffer.len() * 2).min(CLIENT_HELLO_MAX_WIRE_SIZE), 0);
                 thread::sleep(Duration::from_millis(1));

@@ -41,12 +41,11 @@ The sample client config uses three top-level sections:
 The binary reads runtime values from the config file. These command-line options
 override the corresponding config values when supplied:
 
-| Option                      | Config value                  |
-| --------------------------- | ----------------------------- |
-| `--password`                | `anytls.password`             |
-| `--max-streams-per-session` | `anytls.maxStreamsPerSession` |
-| `--listen`                  | `client.listen`               |
-| `--server-addr`             | `client.serverAddr`           |
+| Option          | Config value        |
+| --------------- | ------------------- |
+| `--password`    | `anytls.password`   |
+| `--listen`      | `client.listen`     |
+| `--server-addr` | `client.serverAddr` |
 
 For example:
 
@@ -63,14 +62,13 @@ file when that is a concern.
 The `anytls` section carries the shared password and the client-side pool
 knobs:
 
-| Field                  | Default  | Description                                                             |
-| ---------------------- | -------- | ----------------------------------------------------------------------- |
-| `password`             | required | AnyTLS shared password                                                  |
-| `clientId`             | omitted  | Optional UUID sent in the AnyTLS authentication padding                 |
-| `idleCheckSecs`        | 30       | How often to reap idle AnyTLS sessions                                  |
-| `idleTimeoutSecs`      | 30       | Idle session lifetime before close                                      |
-| `minIdleSessions`      | 5        | Minimum warm idle sessions to keep                                      |
-| `maxStreamsPerSession` | 8        | Maximum logical streams per session; set to `1` to disable multiplexing |
+| Field             | Default  | Description                                             |
+| ----------------- | -------- | ------------------------------------------------------- |
+| `password`        | required | AnyTLS shared password                                  |
+| `clientId`        | omitted  | Optional UUID sent in the AnyTLS authentication padding |
+| `idleCheckSecs`   | 30       | How often to reap idle AnyTLS sessions                  |
+| `idleTimeoutSecs` | 30       | Idle session lifetime before close                      |
+| `minIdleSessions` | 5        | Minimum warm idle sessions to keep                      |
 
 ### ClientHello profiles
 

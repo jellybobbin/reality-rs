@@ -245,14 +245,14 @@ mod tests {
                 anytls::PaddingFactory::new(anytls::DEFAULT_SCHEME).unwrap(),
             ))
         };
-        let server = Session::new_server(2, Box::new(server_io), padding(), 8, anytls::DEFAULT_MAX_SESSION_AGE);
+        let server = Session::new_server(2, Box::new(server_io), padding(), anytls::DEFAULT_MAX_SESSION_AGE);
         let server_accept = server.clone();
         tokio::spawn(async move {
             while let Ok(stream) = server_accept.accept_stream().await {
                 sender.send(Arc::new(stream)).unwrap();
             }
         });
-        let client = Session::new_client(1, Box::new(client_io), padding(), 8, anytls::DEFAULT_MAX_SESSION_AGE);
+        let client = Session::new_client(1, Box::new(client_io), padding(), anytls::DEFAULT_MAX_SESSION_AGE);
         client.run().await.unwrap();
         server.run().await.unwrap();
         let local = Arc::new(client.open_stream().await.unwrap());

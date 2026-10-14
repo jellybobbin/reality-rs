@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TCP smoke test for anyreality with SOCKS5 CONNECT and SNI fallback coverage."""
+"""TCP smoke test for anyreality with SOCKS5 CONNECT and optional external SNI fallback coverage."""
 
 import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -135,6 +135,24 @@ def start_http_target_server(listen_endpoint):
     return {'server': server, 'thread': thread}
 
 
+def can_reach_external_tls(host):
+    try:
+        result = subprocess.run(
+            [
+                'curl', '--silent', '--show-error', '--head',
+                '--connect-timeout', '5', '--max-time', '10', '--noproxy', '*',
+                '--output', os.devnull,
+                f'https://{host}/',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
 def assert_process_running(entry, label):
     if 'server' in entry and not entry['thread'].is_alive():
         raise RuntimeError(f'{label} stopped unexpectedly')
@@ -227,7 +245,7 @@ Examples:
             'shortIds = ["aabbcc"]\n'
             'privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"\n'
             'version = "010203"\n'
-            'serverNames = ["example.com", "baidu.com", "www.baidu.com"]\n\n'
+            'serverNames = ["localhost", "www.baidu.com"]\n\n'
             '[anytls]\n'
             'password = "reality-smoke-password"\n\n'
             '[server]\n'
@@ -239,7 +257,7 @@ Examples:
             '[reality]\n'
             'shortId = "aabbcc"\n'
             'publicKey = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"\n'
-            'serverName = "example.com"\n'
+            'serverName = "localhost"\n'
             'version = "010203"\n\n'
             '[anytls]\n'
             'password = "reality-smoke-password"\n'
@@ -297,7 +315,22 @@ Examples:
         smoke_response = response.stdout
         print(f'Smoke response: {smoke_response.rstrip()}')
 
+        client_entry['process'].terminate()
+        try:
+            client_entry['process'].wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            client_entry['process'].kill()
+            client_entry['process'].wait()
+
         print('Running HTTP CONNECT smoke request')
+        print(f'Starting fresh formal client on {client_listen}')
+        http_client_entry = start_process(repo_root, [client_binary, '--log', 'trace', '--config', client_config_path], 'reality-client-http')
+        entries.append(http_client_entry)
+        time.sleep(0.5)
+        assert_process_running(http_client_entry, 'Formal HTTP CONNECT client')
+        if not wait_tcp(*split_endpoint(client_listen), timeout=5.0):
+            raise RuntimeError('Timed out waiting for formal HTTP CONNECT client')
+
         http_response = subprocess.run(
             [
                 'curl', '--silent', '--show-error', '--fail', '--proxytunnel',
@@ -318,25 +351,32 @@ Examples:
         print(f'HTTP CONNECT response: {http_smoke_response.rstrip()}')
 
         server_host, server_port = split_endpoint(server_listen)
-        print(f'Running direct SNI fallback probe to baidu.com on {server_listen}')
-        fallback = subprocess.run(
-            [
-                'curl', '--silent', '--show-error', '--fail',
-                '--connect-timeout', str(CURL_CONNECT_TIMEOUT_SECONDS),
-                '--max-time', str(CURL_MAX_TIME_SECONDS),
-                '--resolve', f'baidu.com:{server_port}:{server_host}',
-                f'https://baidu.com:{server_port}/',
-            ],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            timeout=CURL_MAX_TIME_SECONDS + 5,
-        )
-        if fallback.returncode != 0:
-            show_logs(entries)
-            raise RuntimeError(f'Fallback curl probe exited with status {fallback.returncode}: {fallback.stderr.strip()}')
+        if can_reach_external_tls('www.baidu.com'):
+            print(f'Running direct SNI fallback probe to www.baidu.com on {server_listen}')
+            fallback = subprocess.run(
+                [
+                    'curl', '--silent', '--show-error', '--fail',
+                    '--connect-timeout', str(CURL_CONNECT_TIMEOUT_SECONDS),
+                    '--max-time', str(CURL_MAX_TIME_SECONDS),
+                    '--output', os.devnull,
+                    '--write-out', 'HTTP %{http_code}; TLS %{time_appconnect}s\n',
+                    '--resolve', f'www.baidu.com:{server_port}:{server_host}',
+                    f'https://www.baidu.com:{server_port}/',
+                ],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=CURL_MAX_TIME_SECONDS + 5,
+            )
+            if fallback.returncode != 0:
+                show_logs(entries)
+                raise RuntimeError(f'Fallback curl probe exited with status {fallback.returncode}: {fallback.stderr.strip()}')
 
-        print(f'Fallback probe response: {fallback.stdout.rstrip()}')
+            print(f'Fallback probe completed: {fallback.stdout.strip()}')
+        else:
+            print('Skipping direct SNI fallback probe: direct HTTPS to www.baidu.com is unavailable')
 
         if smoke_response != 'reality tunnel ok':
             show_logs(entries)

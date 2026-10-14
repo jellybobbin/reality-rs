@@ -187,7 +187,6 @@ serverName = "$the_site"
 
 [anytls]
 password = "$password"
-maxStreamsPerSession = 4
 
 [client]
 listen = "mixed://127.0.0.1:2080"

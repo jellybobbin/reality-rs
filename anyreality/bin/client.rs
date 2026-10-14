@@ -14,8 +14,7 @@
 //!   `rustls_util::StreamOwned`, then is bridged into a tokio
 //!   `DuplexStream` so anytls can drive it asynchronously.
 //! - Idle anytls sessions are reused for subsequent SOCKS requests
-//!   (`Client::create_stream` picks an idle session under the
-//!   `MAX_STREAMS_PER_SESSION` limit, otherwise dials a new one).
+//!   (`Client::create_stream` picks an idle session, otherwise dials a new one).
 //! - SOCKS5 supports `CONNECT` (TCP) and `UDP ASSOCIATE` (anytls UoT
 //!   Datagram mode, see `anytls::uot`).
 
@@ -52,7 +51,6 @@ const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:1080";
 const DEFAULT_IDLE_CHECK_SECS: u64 = 30;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MIN_IDLE_SESSIONS: usize = 5;
-const DEFAULT_MAX_STREAMS_PER_SESSION: usize = 8;
 const DEFAULT_CLIENT_HELLO_PROFILE: &str = "default";
 const DEFAULT_PADDING_LEN: usize = 0;
 const MAX_PROXY_CONNECTIONS: usize = 256;
@@ -68,10 +66,6 @@ struct Args {
     /// Override anytls.password from the config file.
     #[arg(short, long, value_name = "PASSWORD")]
     password: Option<String>,
-
-    /// Override anytls.maxStreamsPerSession from the config file.
-    #[arg(short, long, value_name = "COUNT")]
-    max_streams_per_session: Option<usize>,
 
     /// Override client.listen from the config file.
     /// It looks like this: "mixed://127.0.0.1:1080", the scheme can be "mixed", "socks5", "http", etc.
@@ -126,8 +120,6 @@ struct ClientAnytlsConfig {
     idle_timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     min_idle_sessions: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_streams_per_session: Option<usize>,
 }
 
 /// The runtime configuration for the client, including listen address, server address, and optional probe proxy.
@@ -203,7 +195,6 @@ async fn main() -> Result<()> {
         }),
         padding,
         Duration::from_secs(anytls.idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS)),
-        anytls.max_streams_per_session.unwrap_or(DEFAULT_MAX_STREAMS_PER_SESSION),
         Duration::ZERO,
     );
     let http_connector_client = anytls_client.clone();
@@ -528,8 +519,6 @@ mod client_listener_tests {
             "unused.toml",
             "--password",
             "cli-password",
-            "--max-streams-per-session",
-            "12",
             "--listen",
             "http://127.0.0.1:2080",
             "--server-addr",
@@ -537,7 +526,7 @@ mod client_listener_tests {
         ])
         .unwrap();
         let mut config: ClientConfigFile = toml::from_str(
-            "[anytls]\npassword = 'config-password'\nmaxStreamsPerSession = 3\n\n[client]\nlisten = 'mixed://127.0.0.1:1080'\nserverAddr = '127.0.0.1:9445'\nprobeProxy = '127.0.0.1:8080'\n",
+            "[anytls]\npassword = 'config-password'\n\n[client]\nlisten = 'mixed://127.0.0.1:1080'\nserverAddr = '127.0.0.1:9445'\nprobeProxy = '127.0.0.1:8080'\n",
         )
         .unwrap();
         let no_overrides = Args::try_parse_from(["anyreality-client", "--config", "unused.toml"]).unwrap();
@@ -545,7 +534,6 @@ mod client_listener_tests {
         apply_cli_overrides(&mut unchanged, &no_overrides);
         let unchanged_anytls = unchanged.anytls.unwrap();
         assert_eq!(unchanged_anytls.password.as_deref(), Some("config-password"));
-        assert_eq!(unchanged_anytls.max_streams_per_session, Some(3));
         let unchanged_client = unchanged.client.unwrap();
         assert_eq!(unchanged_client.server_addr, Some("127.0.0.1:9445".parse().unwrap()));
         assert_eq!(unchanged_client.probe_proxy, Some("127.0.0.1:8080".parse().unwrap()));
@@ -558,7 +546,6 @@ mod client_listener_tests {
 
         let anytls = config.anytls.unwrap();
         assert_eq!(anytls.password.as_deref(), Some("cli-password"));
-        assert_eq!(anytls.max_streams_per_session, Some(12));
         let client = config.client.unwrap();
         assert_eq!(client.server_addr, Some("192.0.2.10:20443".parse().unwrap()));
         assert_eq!(client.probe_proxy, Some("127.0.0.1:8080".parse().unwrap()));
@@ -798,23 +785,16 @@ fn resolve_client_config(config_path: &Path, args: &Args) -> Result<ClientConfig
         anytls.idle_check_secs.get_or_insert(DEFAULT_IDLE_CHECK_SECS);
         anytls.idle_timeout_secs.get_or_insert(DEFAULT_IDLE_TIMEOUT_SECS);
         anytls.min_idle_sessions.get_or_insert(DEFAULT_MIN_IDLE_SESSIONS);
-        anytls.max_streams_per_session.get_or_insert(DEFAULT_MAX_STREAMS_PER_SESSION);
-        if let Some(max_streams) = anytls.max_streams_per_session.as_mut() {
-            *max_streams = (*max_streams).max(1);
-        }
     }
 
     Ok(file_config)
 }
 
 fn apply_cli_overrides(file_config: &mut ClientConfigFile, args: &Args) {
-    if args.password.is_some() || args.max_streams_per_session.is_some() {
+    if args.password.is_some() {
         let anytls = file_config.anytls.get_or_insert_with(ClientAnytlsConfig::default);
         if let Some(password) = &args.password {
             anytls.password = Some(password.clone());
-        }
-        if let Some(max_streams) = args.max_streams_per_session {
-            anytls.max_streams_per_session = Some(max_streams);
         }
     }
 

@@ -56,7 +56,7 @@ edition = "2024"
 anyhow = "1.0.104"
 asn1 = "0.24.1"
 async-trait = "0.1.92"
-aws-lc-rs = { version = "1.18.1", default-features = false }
+aws-lc-rs = { version = "1.18.2", default-features = false }
 base64 = "0.23.1"
 bencher = "0.1.5"
 brotli = { version = "9.0.0", default-features = false, features = ["std"] }
@@ -91,13 +91,13 @@ rustls-graviola = { version = "0.4.0" }
 rustls-test = { path = "rustls-test/", default-features = false }
 rustls-util = { path = "rustls-util/" }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.152"
-sha2 = "0.11.0"
+serde_json = "1.0.154"
+sha2 = "0.11.1"
 socks5-impl = "0.9.8"
 subtle = { version = "2.6.1", default-features = false }
 time = { version = "0.3.55", default-features = false }
 tikv-jemallocator = "0.7.0"
-tokio = { version = "1.53.2", features = ["io-util", "macros", "net", "rt"] }
+tokio = { version = "1.53.3", features = ["io-util", "macros", "net", "rt"] }
 tokio-rustls = "0.26.6"
 toml = "1.1.8"
 tracing = { version = "0.1.44", default-features = false }

@@ -3,12 +3,11 @@
         "shortId": "aabbcc",
         "publicKey": "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg",
         "version": "010203",
-        "serverName": "test",
+        "serverName": "example.com",
         "clientHelloProfile": "chrome"
     },
     "anytls": {
         "clientId": null,
-        "maxStreamsPerSession": 8,
         "password": "reality-smoke-password",
         "idleCheckSecs": 30,
         "idleTimeoutSecs": 30,

@@ -12,8 +12,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/ssrlive/reality-rs/main/instal
 要求 你输入 你选定的 伪装网站的 域名 和 在主机上监听 的 端口。
 
 > [!NOTE]
-> 如下所示(这里输入示例是 `cn.bing.com` 和 443 , 提醒一点，请一定选与示例不同的中国能访问的国外网站，否则可能引起 GFW 的封杀；
-> 443 端口 可能已经占用， 你可以选其它空闲的端口)
+> 这里输入示例是 `cn.bing.com` 和 `443` , 提醒一点，请一定选与示例不同的中国能访问的国外网站，否则可能引起 GFW 的封杀；
+> `443` 端口 可能已经占用， 你可以选其它空闲的端口
 
 ```plaintext
 ... (略) ...
@@ -70,7 +70,7 @@ Install complete. Server config: /etc/anyreality/config.toml; client config prin
 anyreality-client --config /your/path/to/anyreality-client-config.toml
 ```
 
-客户端成功连接服务端后， 根据配置里的 `listen = "127.0.0.1:2080"` 参数，它会在 127.0.0.1:2080 同时监听 SOCKS5 和 HTTP CONNECT 代理。
+客户端成功连接服务端后， 根据配置里的 `listen = "mixed://127.0.0.1:2080"` 参数，它会在 127.0.0.1:2080 同时监听 SOCKS5 和 HTTP CONNECT 代理。
 你可以在本地的浏览器里设置 SOCKS5 或 HTTP 代理为这个地址，通过 anyreality 连接到你的目标服务器。
 
 > [!TIP]
