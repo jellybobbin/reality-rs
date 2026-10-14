@@ -72,9 +72,9 @@ struct Args {
     #[arg(long, value_name = "URI")]
     listen: Option<ProxyParameters>,
 
-    /// Override client.serverAddr from the config file. It looks like this: "127.0.0.1:1080".
+    /// Override client.serverAddr from the config file. Accepts IP or hostname, for example "127.0.0.1:1080" and "mysite.com:6789".
     #[arg(short, long, value_name = "ADDR")]
-    server_addr: Option<SocketAddr>,
+    server_addr: Option<Address>,
 
     /// Log filter (off/error/warn/info/debug/trace or env-style spec).
     #[arg(short, long, value_name = "LEVEL", default_value = DEFAULT_LOG_LEVEL)]
@@ -133,7 +133,7 @@ struct ClientRuntimeConfig {
 
     /// The address of the server to connect to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    server_addr: Option<SocketAddr>,
+    server_addr: Option<Address>,
 
     /// The address of the optional probe proxy to use for connecting to the server.
     /// If specified, the client will connect to the server through this proxy.
@@ -143,7 +143,7 @@ struct ClientRuntimeConfig {
 
 #[derive(Clone)]
 struct DialCtx {
-    server_addr: SocketAddr,
+    server_addr: Address,
     probe_proxy: Option<SocketAddr>,
     tls_config: Arc<rustls::ClientConfig>,
     server_name: String,
@@ -167,7 +167,7 @@ async fn main() -> Result<()> {
     let listen_mode = local_proxy_mode(listen)?;
     let listen_addr = listen.addr.as_ref().expect("validated client listen address");
     let http_credentials = listen.credentials.clone();
-    let server_addr = client.server_addr.expect("validated client server address");
+    let server_addr = client.server_addr.clone().expect("validated client server address");
     let server_name = reality.server_name.clone().expect("validated reality server name");
     let padding = Arc::new(tokio::sync::RwLock::new(
         PaddingFactory::new(DEFAULT_SCHEME).expect("valid default padding scheme"),
@@ -176,7 +176,7 @@ async fn main() -> Result<()> {
     let password_sha256 = Sha256::digest(anytls.password.as_deref().expect("validated anytls password").as_bytes()).into();
 
     let dial_ctx = Arc::new(DialCtx {
-        server_addr,
+        server_addr: server_addr.clone(),
         probe_proxy: client.probe_proxy,
         tls_config,
         server_name: server_name.clone(),
@@ -254,9 +254,9 @@ async fn dial_carrier(ctx: Arc<DialCtx>) -> std::io::Result<Box<dyn AsyncReadWri
     // 1) Plain TCP connect, optionally via an HTTP CONNECT probe proxy.
     let tokio_tcp = if let Some(proxy_addr) = ctx.probe_proxy {
         log::info!("Connecting to REALITY server via probe proxy at {proxy_addr}");
-        connect_via_probe_proxy(proxy_addr, ctx.server_addr).await?
+        connect_via_probe_proxy(proxy_addr, ctx.server_addr.clone()).await?
     } else {
-        TcpStream::connect(&ctx.server_addr).await?
+        TcpStream::connect(ctx.server_addr.to_string()).await?
     };
     tokio_tcp.set_nodelay(true).ok();
     let std_tcp = tokio_tcp.into_std()?;
@@ -325,7 +325,7 @@ async fn dial_carrier(ctx: Arc<DialCtx>) -> std::io::Result<Box<dyn AsyncReadWri
     Ok(Box::new(bridge) as Box<dyn AsyncReadWrite>)
 }
 
-async fn connect_via_probe_proxy(proxy_addr: SocketAddr, target: SocketAddr) -> std::io::Result<TcpStream> {
+async fn connect_via_probe_proxy(proxy_addr: SocketAddr, target: Address) -> std::io::Result<TcpStream> {
     let mut stream = TcpStream::connect(proxy_addr).await?;
     stream.set_nodelay(true)?;
 
@@ -522,7 +522,7 @@ mod client_listener_tests {
             "--listen",
             "http://127.0.0.1:2080",
             "--server-addr",
-            "192.0.2.10:20443",
+            "mysite.com:6789",
         ])
         .unwrap();
         let mut config: ClientConfigFile = toml::from_str(
@@ -547,11 +547,21 @@ mod client_listener_tests {
         let anytls = config.anytls.unwrap();
         assert_eq!(anytls.password.as_deref(), Some("cli-password"));
         let client = config.client.unwrap();
-        assert_eq!(client.server_addr, Some("192.0.2.10:20443".parse().unwrap()));
+        assert_eq!(client.server_addr, Some("mysite.com:6789".parse().unwrap()));
         assert_eq!(client.probe_proxy, Some("127.0.0.1:8080".parse().unwrap()));
         let listen = client.listen.unwrap();
         assert_eq!(local_proxy_mode(&listen).unwrap(), LocalProxyMode::Http);
         assert_eq!(listen.addr.unwrap().to_string(), "127.0.0.1:2080");
+    }
+
+    #[test]
+    fn server_addr_accepts_domain_names_in_toml_and_json() {
+        let toml: ClientRuntimeConfig = toml::from_str("serverAddr = 'mysite.com:6789'").unwrap();
+        let json: ClientRuntimeConfig = serde_json::from_str(r#"{"serverAddr":"mysite.com:6789"}"#).unwrap();
+        let expected = Some(Address::from(("mysite.com", 6789)));
+
+        assert_eq!(toml.server_addr, expected);
+        assert_eq!(json.server_addr, expected);
     }
 
     #[test]
@@ -803,8 +813,8 @@ fn apply_cli_overrides(file_config: &mut ClientConfigFile, args: &Args) {
         if let Some(listen) = &args.listen {
             client.listen = Some(listen.clone());
         }
-        if let Some(server_addr) = args.server_addr {
-            client.server_addr = Some(server_addr);
+        if let Some(server_addr) = &args.server_addr {
+            client.server_addr = Some(server_addr.clone());
         }
     }
 }

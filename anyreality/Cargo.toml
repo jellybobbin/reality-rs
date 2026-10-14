@@ -37,7 +37,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 socks-hub = { version = "0.2.11", default-features = false, features = ["httpproxy"] }
-socks5-impl = { workspace = true, features = ["server"] }
+socks5-impl = { workspace = true, features = ["server", "serde"] }
 tokio = { workspace = true, features = [
     "io-std",
     "io-util",
