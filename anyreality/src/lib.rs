@@ -158,7 +158,7 @@ where
     R: AsyncRead + Unpin + Send,
 {
     use anytls::{UotMode, uot_encode_packet, uot_get_packet_from_stream};
-    use socks5_impl::protocol::Address;
+    use socks5_impl::Address;
     use std::io::{Error, ErrorKind::InvalidData};
     let outbound = async {
         loop {
@@ -298,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn uot_partial_packet_survives_reverse_traffic() {
         use anytls::{UotMode, uot_encode_packet, uot_get_packet_from_stream};
-        use socks5_impl::protocol::Address;
+        use socks5_impl::Address;
         timeout(Duration::from_secs(5), async {
             for mode in [UotMode::Datagram, UotMode::Connected] {
                 let (client, server, local, remote) = stream_pair().await;
@@ -373,7 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_relay_forwards_bytes_buffered_while_reading_destination() {
-        use socks5_impl::protocol::{Address, AsyncStreamOperation};
+        use socks5_impl::{Address, AsyncStreamOperation};
 
         timeout(Duration::from_secs(3), async {
             let (client, server, stream, remote) = stream_pair().await;

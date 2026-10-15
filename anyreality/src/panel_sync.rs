@@ -3,7 +3,7 @@ use anytls::{
 };
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use socks5_impl::protocol::Address;
+use socks5_impl::Address;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;

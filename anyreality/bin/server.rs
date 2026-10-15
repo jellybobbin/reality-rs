@@ -43,7 +43,7 @@ use rustls::server::{
 use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};
 use sha2::{Digest, Sha256};
-use socks5_impl::protocol::{Address, AsyncStreamOperation};
+use socks5_impl::{Address, AsyncStreamOperation};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
