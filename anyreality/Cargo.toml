@@ -1,6 +1,6 @@
 [package]
 name = "anyreality"
-version = "0.4.7"
+version = "0.4.8"
 edition = "2024"
 publish = false
 
@@ -15,7 +15,7 @@ path = "bin/server.rs"
 [dependencies]
 aes-gcm = "0.11.1"
 anyhow = { workspace = true }
-anytls = { version = "0.5.1", default-features = false, features = [
+anytls = { version = "0.5.2", default-features = false, features = [
     "panel-sync",
     "uot",
     "runtime",
@@ -37,7 +37,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 socks-hub = { version = "0.2.12", default-features = false, features = ["httpproxy"] }
-socks5-impl = { version = "0.10.0", features = ["server", "serde"] }
+socks5-impl = { version = "0.10.2", features = ["server", "serde"] }
 tokio = { workspace = true, features = [
     "io-std",
     "io-util",
