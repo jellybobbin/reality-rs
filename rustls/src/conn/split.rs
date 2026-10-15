@@ -4,22 +4,22 @@ use core::fmt;
 use core::ops::Range;
 use std::sync::MutexGuard;
 
+use super::kernel::KernelConnection;
 use super::receive::{Discard, JoinOutput};
+use super::{
+    Connection, ConnectionOutputs, DataKind, Encrypter, MessageIter, MessageIterMode, ReceivePath,
+    SendOutput, SendPath, SideData, Tcp, TlsInputBuffer,
+};
 use crate::client::ClientSide;
 use crate::common_state::UnborrowedPayload;
-use crate::conn::kernel::KernelConnection;
-use crate::conn::{
-    ConnectionCommon, DataKind, MessageIter, MessageIterMode, ReceivePath, SendOutput, SendPath,
-    TlsInputBuffer,
-};
-use crate::crypto::cipher::{OutboundPlain, RecordEncrypter};
+use crate::crypto::cipher::OutboundPlain;
 use crate::enums::ProtocolVersion;
-use crate::error::{AlertDescription, ApiMisuse};
+use crate::error::{AlertDescription, ApiMisuse, Error};
 use crate::lock::Mutex;
 use crate::msgs::{AlertLevel, Delocator, Message};
+use crate::suites::ExtractedSecrets;
 use crate::sync::Arc;
 use crate::tls13::key_schedule::KeyScheduleTrafficSend;
-use crate::{ConnectionOutputs, Error, ExtractedSecrets, SideData};
 
 /// A post-handshake connection which has been split by direction.
 ///
@@ -80,7 +80,10 @@ impl<Side: SideData> SplitConnection<Side> {
             state, recv, send, ..
         } = receive;
 
-        let mut send = send.lock().unwrap();
+        let send = Arc::into_inner(send)
+            .unwrap()
+            .into_inner()
+            .unwrap();
 
         // pending data has consumed send sequence numbers so discarding it here
         // would leave the extracted secrets ahead of what the peer receives.
@@ -88,19 +91,19 @@ impl<Side: SideData> SplitConnection<Side> {
             return Err(ApiMisuse::KernelConnectionWithPendingSendData.into());
         }
 
-        ConnectionCommon::<Side>::from_parts_into_kernel_connection(
-            &mut send.send,
-            recv,
-            outputs,
-            state,
-        )
+        Connection::<Side, Tcp>::from_parts_into_kernel_connection(send.send, recv, outputs, state)
     }
 }
 
-impl<Side: SideData> TryFrom<ConnectionCommon<Side>> for SplitConnection<Side> {
+impl<Side: SideData> TryFrom<Connection<Side, Tcp>> for SplitConnection<Side> {
     type Error = Error;
 
-    fn try_from(conn: ConnectionCommon<Side>) -> Result<Self, Error> {
+    fn try_from(conn: Connection<Side, Tcp>) -> Result<Self, Error> {
+        // `SplitConnection` cannot be used to progress a handshake.
+        if conn.is_handshaking() {
+            return Err(ApiMisuse::SplitDuringHandshake.into());
+        }
+
         let send = Arc::new(Mutex::new(SendInner {
             send: conn.common.send,
             aside_buffer: Vec::new(),
@@ -552,10 +555,10 @@ impl SendOutput for SendAdapter<'_> {
             .note_key_update_response();
     }
 
-    fn set_encrypter(&mut self, cipher: Box<dyn RecordEncrypter>, max_records: u64) {
+    fn set_encrypter(&mut self, encrypter: Encrypter) {
         self.as_locked(false)
             .send
-            .set_encrypter(cipher, max_records);
+            .set_encrypter(encrypter);
     }
 
     fn update_key_schedule(&mut self, schedule: Box<KeyScheduleTrafficSend>) {
@@ -606,9 +609,10 @@ mod tests {
             .queue_requested_key_update()
             .unwrap()));
         assert!(!send_flag_for(|adapter| adapter.note_key_update_response()));
-        assert!(!send_flag_for(
-            |adapter| adapter.set_encrypter(Box::new(Tls13Cipher), 1234)
-        ));
+        assert!(!send_flag_for(|adapter| adapter.set_encrypter(Encrypter {
+            encrypter: Box::new(Tls13Cipher),
+            limit: 1234,
+        })));
         // update_key_schedule too hard
         assert!(send_flag_for(|adapter| adapter
             .send_alert(
@@ -626,7 +630,10 @@ mod tests {
     #[test]
     fn pending_send_data() {
         let mut send = SendPath::default();
-        send.set_encrypter(Box::new(Tls13Cipher), 1234);
+        send.set_encrypter(Encrypter {
+            encrypter: Box::new(Tls13Cipher),
+            limit: 1234,
+        });
         send.may_send_application_data = true;
 
         let mut inner = SendInner {
@@ -670,7 +677,10 @@ mod tests {
 
     fn send_flag_for(f: impl FnOnce(&mut SendAdapter<'_>)) -> bool {
         let mut send = SendPath::default();
-        send.set_encrypter(Box::new(Tls13Cipher), 1234);
+        send.set_encrypter(Encrypter {
+            encrypter: Box::new(Tls13Cipher),
+            limit: 1234,
+        });
 
         let send = Mutex::new(SendInner {
             send,

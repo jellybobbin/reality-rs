@@ -1,6 +1,6 @@
 [package]
 name = "rustls-aws-lc-rs"
-version = "0.1.0-dev.1"
+version = "0.24.0-dev.2"
 edition.workspace = true
 rust-version = "1.85"
 license = "Apache-2.0 OR ISC OR MIT"
@@ -20,7 +20,7 @@ std = []
 aws-lc-rs = { workspace = true, features = ["prebuilt-nasm"] }
 pki-types = { workspace = true }
 rcgen = { workspace = true, features = ["aws_lc_rs"], optional = true }
-rustls = { path = "../rustls", version = "0.24.0-dev.1", default-features = false }
+rustls = { path = "../rustls", version = "0.24.0-dev.2", default-features = false }
 subtle = { workspace = true }
 zeroize = { workspace = true }
 

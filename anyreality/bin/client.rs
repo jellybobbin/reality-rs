@@ -28,7 +28,6 @@ use anytls::{uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destina
 use clap::Parser;
 use core::net::SocketAddr;
 use core::time::Duration;
-use rustls::Connection;
 use rustls::client::{ClientHelloProfile, Resumption};
 use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};

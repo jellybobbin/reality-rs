@@ -33,13 +33,11 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_S
 use clap::Parser;
 use core::hash::Hasher;
 use core::time::Duration;
-use rustls::Connection;
-use rustls::ServerConfig;
-use rustls::ServerConnection;
 use rustls::crypto::SelectedCredential;
 use rustls::server::{
     ClientHello, ClientHelloVerifier, RealityClientHello, RealityClientHelloProbe, RealityServerHelloAction, ServerCredentialResolver,
 };
+use rustls::{Connection, ServerConfig, ServerSide};
 use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};
 use sha2::{Digest, Sha256};
@@ -293,12 +291,12 @@ async fn handle_connection(
     };
 
     // 1) REALITY blocking handshake on a worker thread.
-    let tls = tokio::task::spawn_blocking(move || -> Result<StreamOwned<ServerConnection, std::net::TcpStream>> {
+    let tls = tokio::task::spawn_blocking(move || -> Result<StreamOwned<ServerSide, std::net::TcpStream>> {
         let sock = std_stream;
         sock.set_nonblocking(false)?;
         sock.set_read_timeout(Some(REALITY_HANDSHAKE_TIMEOUT))?;
         sock.set_write_timeout(Some(REALITY_HANDSHAKE_TIMEOUT))?;
-        let mut conn = ServerConnection::new(reality_config)?;
+        let mut conn = Connection::new(reality_config)?;
         if let Some(template) = server_hello_template {
             conn.set_reality_server_hello_template(&template)
                 .context("install SNI target ServerHello template")?;

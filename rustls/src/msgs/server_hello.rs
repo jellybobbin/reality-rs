@@ -237,7 +237,7 @@ impl<'a> Codec<'a> for ServerExtensions<'a> {
             out.read_one(&mut sub, |unknown| checker.check(unknown))?;
         }
 
-        out.unknown_extensions = checker.0;
+        out.unknown_extensions = checker.into_btreeset();
         Ok(out)
     }
 }
@@ -354,7 +354,7 @@ impl<'a> Codec<'a> for EncryptedExtensions<'a> {
             })?;
         }
 
-        out.unknown_extensions = checker.0;
+        out.unknown_extensions = checker.into_btreeset();
         Ok(out)
     }
 }
@@ -447,7 +447,7 @@ impl EchConfigContents {
     /// Returns true if there is more than one extension of a given
     /// type.
     pub(crate) fn has_duplicate_extension(&self) -> bool {
-        has_duplicates::<_, _, u16>(
+        has_duplicates(
             self.extensions
                 .iter()
                 .map(|ext| ext.ext_type()),

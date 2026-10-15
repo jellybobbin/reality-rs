@@ -16,13 +16,13 @@ pub use crate::webpki::{
 
 pub(crate) mod config;
 pub use config::{
-    CipherSuiteSelector, ClientHello, ClientHelloVerifier, InvalidSniPolicy, PreferClientOrder,
-    PreferServerOrder, ServerConfig, ServerCredentialResolver, StoresServerSessions, Tls13Tickets,
-    WantsServerCert,
+    CipherSuiteSelector, ClientHello, ClientHelloVerifier, InvalidSniPolicy, KeyExchangeSelector,
+    OfferedKxGroup, PreferClientOrder, PreferServerOrder, ServerConfig, ServerCredentialResolver,
+    StoresServerSessions, Tls13Tickets, WantsServerCert,
 };
 
 mod connection;
-pub use connection::{ServerConnection, ServerHandshake, ServerSide};
+pub use connection::{ServerHandshake, ServerSide};
 
 pub use crate::conn::Accepted;
 

@@ -6,7 +6,7 @@ use core::fmt;
 
 use pki_types::DnsName;
 
-use super::config::{CipherSuiteSelector, VersionSuiteSelector};
+use super::config::{CipherSuiteSelector, OfferedKxGroup, VersionSuiteSelector};
 use super::reality::RealityClientHello;
 use super::{ClientHello, CommonServerSessionValue, ServerConfig};
 use crate::SupportedCipherSuite;
@@ -22,8 +22,9 @@ use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
 use crate::kernel::KernelState;
 use crate::msgs::{
     ClientHelloPayload, Compression, EncryptedExtensions, HandshakeAlignedProof,
-    HandshakeMessagePayload, HandshakePayload, Message, MessagePayload, Random, ServerExtensions,
-    ServerExtensionsInput, ServerNamePayload, SessionId, SingleProtocolName, TransportParameters,
+    HandshakeMessagePayload, HandshakePayload, KeyShareEntry, Message, MessagePayload, Random,
+    ServerExtensions, ServerExtensionsInput, ServerNamePayload, SessionId, SingleProtocolName,
+    TransportParameters,
 };
 use crate::sealed::Sealed;
 use crate::server::ServerSide;
@@ -616,18 +617,16 @@ impl ExpectClientHello {
         // So: reduce the offered sigschemes to those compatible with the
         // intersection of ciphersuites.
         let suites = <CryptoProvider as Borrow<[&'static T]>>::borrow(&self.config.provider);
-        let client_suites = suites
-            .iter()
-            .filter(|&&scs| {
-                input
-                    .client_hello
-                    .cipher_suites
-                    .contains(&scs.suite())
-            })
-            .collect::<Vec<_>>();
+        let client_suites = suites.iter().filter(|&&scs| {
+            input
+                .client_hello
+                .cipher_suites
+                .contains(&scs.suite())
+        });
 
         let mut sig_schemes = input.sig_schemes.to_owned();
         if T::VERSION == ProtocolVersion::TLSv1_2 {
+            let client_suites = client_suites.collect::<Vec<_>>();
             sig_schemes.retain(|scheme| {
                 client_suites
                     .iter()
@@ -674,6 +673,11 @@ impl ExpectClientHello {
                 .named_groups
                 .as_deref()
                 .unwrap_or_default(),
+            input
+                .client_hello
+                .key_shares
+                .as_deref()
+                .unwrap_or_default(),
             &input.client_hello.cipher_suites,
         )?;
 
@@ -702,8 +706,9 @@ impl ExpectClientHello {
         suites: &[&'static T],
         sig_scheme: SignatureScheme,
         client_groups: &[NamedGroup],
+        client_shares: &[KeyShareEntry],
         client_suites: &[CipherSuite],
-    ) -> Result<(&'static T, &'static dyn SupportedKxGroup), PeerIncompatible>
+    ) -> Result<(&'static T, &'static dyn SupportedKxGroup), Error>
     where
         SupportedCipherSuite: From<&'static T>,
         dyn CipherSuiteSelector: VersionSuiteSelector<T>,
@@ -713,27 +718,22 @@ impl ExpectClientHello {
         let mut ecdhe_possible = false;
         let mut ffdhe_possible = false;
         let mut ffdhe_offered = false;
-        let mut supported_groups: Vec<&'static dyn SupportedKxGroup> =
-            Vec::with_capacity(client_groups.len());
 
         for offered_group in client_groups {
             let supported = self
                 .config
                 .provider
-                .find_kx_group(*offered_group, T::VERSION);
+                .find_kx_group(*offered_group, T::VERSION)
+                .is_some();
 
             match offered_group.key_exchange_algorithm() {
                 KeyExchangeAlgorithm::DHE => {
-                    ffdhe_possible |= supported.is_some();
+                    ffdhe_possible |= supported;
                     ffdhe_offered = true;
                 }
                 KeyExchangeAlgorithm::ECDHE => {
-                    ecdhe_possible |= supported.is_some();
+                    ecdhe_possible |= supported;
                 }
-            }
-
-            if let Some(supported) = supported {
-                supported_groups.push(supported);
             }
         }
 
@@ -753,7 +753,7 @@ impl ExpectClientHello {
         };
 
         if !ecdhe_possible && !ffdhe_possible {
-            return Err(PeerIncompatible::NoKxGroupsInCommon);
+            return Err(PeerIncompatible::NoKxGroupsInCommon.into());
         }
 
         // RFC 7919 (https://datatracker.ietf.org/doc/html/rfc7919#section-4) requires us to send
@@ -787,31 +787,53 @@ impl ExpectClientHello {
 
         // Finally, choose a key exchange group that is compatible with the selected cipher
         // suite.
-        let maybe_skxg = supported_groups
-            .iter()
-            .find(|kx_group| {
-                suite.usable_for_kx_algorithm(kx_group.name().key_exchange_algorithm())
-            });
+        let offered = || {
+            client_groups
+                .iter()
+                .filter_map(|&name| {
+                    self.config
+                        .provider
+                        .find_kx_group(name, T::VERSION)
+                })
+                .filter(|kx_group| {
+                    suite.usable_for_kx_algorithm(kx_group.name().key_exchange_algorithm())
+                })
+                .map(|group| OfferedKxGroup {
+                    group,
+                    has_key_share: T::VERSION == ProtocolVersion::TLSv1_3
+                        && client_shares
+                            .iter()
+                            .any(|share| share.group == group.name()),
+                })
+        };
 
-        if T::VERSION == ProtocolVersion::TLSv1_3 {
-            // This unwrap is structurally guaranteed by the early return for `!ffdhe_possible && !ecdhe_possible`
-            return Ok((suite, *maybe_skxg.unwrap()));
-        }
+        let selected = match &self.previous_hello {
+            Some(PreviousClientHello { group, .. }) => Some(
+                offered()
+                    .find(|offer| offer.group.name() == *group)
+                    .ok_or(PeerMisbehaved::RefusedToFollowHelloRetryRequest)?
+                    .group,
+            ),
+            None => self
+                .config
+                .kx_selector
+                .select_key_exchange(&mut offered(), &self.config.provider.kx_groups)
+                .filter(|chosen| offered().any(|offer| offer.group.name() == chosen.name())),
+        };
 
-        // For TLS1.2, the server can unilaterally choose a DHE group if it has one and
-        // there was no better option.
-        match maybe_skxg {
-            Some(skxg) => Ok((suite, *skxg)),
-            None if suite.usable_for_kx_algorithm(KeyExchangeAlgorithm::DHE) => {
-                // If kx for the selected cipher suite is DHE and no DHE groups are specified in the extension,
-                // the server is free to choose DHE params, we choose the first DHE kx group of the provider.
-                if let Some(server_selected_ffdhe_skxg) = first_supported_dhe_kxg {
-                    Ok((suite, *server_selected_ffdhe_skxg))
-                } else {
-                    Err(PeerIncompatible::NoKxGroupsInCommon)
-                }
+        match selected {
+            Some(skxg) => Ok((suite, skxg)),
+            // For TLS1.2, the server can unilaterally choose a DHE group if it has one and
+            // there was no better option.
+            None if T::VERSION == ProtocolVersion::TLSv1_2
+                && offered().next().is_none()
+                && suite.usable_for_kx_algorithm(KeyExchangeAlgorithm::DHE) =>
+            {
+                first_supported_dhe_kxg
+                    .map(|skxg| (suite, *skxg))
+                    .ok_or_else(|| PeerIncompatible::NoKxGroupsInCommon.into())
             }
-            None => Err(PeerIncompatible::NoKxGroupsInCommon),
+            None => Err(PeerIncompatible::NoKxGroupsInCommon.into()),
         }
     }
 
@@ -848,6 +870,7 @@ impl From<Box<ExpectClientHello>> for ServerState {
 pub(crate) struct PreviousClientHello {
     pub(super) offered_psk: bool,
     pub(super) suite: CipherSuite,
+    pub(super) group: NamedGroup,
 }
 
 pub(crate) trait ServerHandler<T>: fmt::Debug + Sealed + Send + Sync {

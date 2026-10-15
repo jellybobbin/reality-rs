@@ -46,7 +46,7 @@ use rustls::server::{
     ClientHelloVerifier, NoServerSessionStorage, RealityClientHello, ServerHandshake,
     WebPkiClientVerifier,
 };
-use rustls::{Connection, RootCertStore, ServerConfig, ServerConnection, VecInput};
+use rustls::{Connection, RootCertStore, ServerConfig, ServerSide, Tcp, VecInput};
 use rustls_aws_lc_rs as provider;
 use tracing::{Level, debug, error};
 
@@ -317,7 +317,7 @@ enum ConnectionState {
         buffered: Vec<u8>,
         fallback_target: FallbackTarget,
     },
-    Tls(ServerConnection),
+    Tls(Connection<ServerSide, Tcp>),
     Passthrough,
 }
 
@@ -492,7 +492,7 @@ impl OpenConnection {
                 buffered: Vec::new(),
             }
         } else {
-            ConnectionState::Tls(ServerConnection::new(tls_config.clone()).unwrap())
+            ConnectionState::Tls(Connection::new(tls_config.clone()).unwrap())
         };
         let back = if needs_acceptor {
             None
@@ -559,7 +559,7 @@ impl OpenConnection {
         }
     }
 
-    fn tls_conn(&self) -> Option<&ServerConnection> {
+    fn tls_conn(&self) -> Option<&Connection<ServerSide, Tcp>> {
         match &self.state {
             ConnectionState::Tls(conn) => Some(conn),
             _ => None,
@@ -838,7 +838,7 @@ impl OpenConnection {
         buffered: &[u8],
         server_hello_template: Option<&[u8]>,
     ) -> Result<(), rustls::Error> {
-        let mut conn = ServerConnection::new(self.tls_config.clone())?;
+        let mut conn = Connection::new(self.tls_config.clone())?;
         if let Some(template) = server_hello_template {
             conn.set_reality_server_hello_template(template)?;
         }
@@ -1088,7 +1088,7 @@ impl OpenConnection {
     fn send_plaintext(&mut self, plaintext: &[u8]) {
         let is_handshaking = self
             .tls_conn()
-            .is_some_and(ServerConnection::is_handshaking);
+            .is_some_and(|connection| connection.is_handshaking());
         if is_handshaking {
             self.pending
                 .extend_from_slice(plaintext);
@@ -1105,7 +1105,7 @@ impl OpenConnection {
     fn flush_pending(&mut self) {
         if self
             .tls_conn()
-            .is_none_or(ServerConnection::is_handshaking)
+            .is_none_or(|connection| connection.is_handshaking())
             || self.pending.is_empty()
         {
             return;

@@ -25,7 +25,9 @@ use crate::conn::{
 };
 use crate::crypto::cipher::{EncodableVersion, Payload};
 use crate::crypto::hash::Hash;
-use crate::crypto::kx::{ActiveKeyExchange, HybridKeyExchange, SharedSecret, StartedKeyExchange};
+use crate::crypto::kx::{
+    ActiveKeyExchange, HybridKeyExchange, NamedGroup, SharedSecret, StartedKeyExchange,
+};
 use crate::crypto::{Identity, SelectedCredential, SignatureScheme, Signer, VerifiedIdentity};
 use crate::enums::{CertificateType, ContentType, HandshakeType, ProtocolVersion};
 use crate::error::{
@@ -43,7 +45,8 @@ use crate::sealed::Sealed;
 use crate::suites::PartiallyExtractedSecrets;
 use crate::sync::Arc;
 use crate::tls13::key_schedule::{
-    KeyScheduleEarlyClient, KeyScheduleHandshake, KeySchedulePreHandshake, KeyScheduleResumption,
+    ClientHandshakeSecrets, ClientTrafficSecrets, EarlyTrafficEncrypter, KeyScheduleEarlyClient,
+    KeyScheduleHandshake, KeySchedulePreHandshake, KeyScheduleResumption,
     KeyScheduleTrafficReceive, KeyScheduleTrafficSend,
 };
 use crate::tls13::{
@@ -222,26 +225,38 @@ impl ClientHandler<Tls13CipherSuite> for Handler {
             output.emit(Event::EchStatus(st.ech_status));
         }
 
-        // Remember what KX group the server liked for next time.
-        config
-            .resumption
-            .store
-            .set_kx_hint(session_key.clone(), their_key_share.group);
-
         // If we change keying when a subsequent handshake message is being joined,
         // the two halves will have different record layer protections.  Disallow this.
         let proof = input.check_aligned_handshake()?;
 
         let hash_at_client_recvd_server_hello = transcript.current_hash();
-        let key_schedule = key_schedule.derive_client_handshake_secrets(
-            in_early_traffic,
+        let ClientHandshakeSecrets {
+            key_schedule,
+            decrypter,
+            quic: quic_secrets,
+        } = key_schedule.derive_client_handshake_secrets(
             hash_at_client_recvd_server_hello,
             suite,
             &*config.key_log,
             &randoms.client,
-            output,
-            &proof,
         );
+
+        if let (Some(quic), Some(update)) = (output.quic(), quic_secrets) {
+            quic.handshake_secrets(update);
+        }
+
+        // Decrypt with the peer's key, encrypt with our own key
+        output
+            .receive()
+            .decrypt_state
+            .set_record_decrypter(decrypter, &proof);
+
+        if !in_early_traffic {
+            // Set the client encryption key for handshakes if early data is not used
+            output
+                .send()
+                .set_encrypter(key_schedule.handshake_encrypter());
+        }
 
         emit_fake_ccs(&mut sent_tls13_fake_ccs, output)?;
 
@@ -262,6 +277,7 @@ impl ClientHandler<Tls13CipherSuite> for Handler {
                 randoms,
                 transcript,
                 key_schedule,
+                kx_group: their_key_share.group,
             },
             resuming_session,
             suite,
@@ -438,12 +454,14 @@ pub(super) fn derive_early_traffic_secret(
     emit_fake_ccs(sent_tls13_fake_ccs, output)?;
 
     let client_hello_hash = transcript_buffer.hash_given(hash_alg, &[]);
-    early_key_schedule.client_early_traffic_secret(
-        &client_hello_hash,
-        key_log,
-        client_random,
-        output,
-    );
+    let EarlyTrafficEncrypter { encrypter, secret } =
+        early_key_schedule.client_early_traffic_secret(&client_hello_hash, key_log, client_random);
+
+    if let Some(quic) = output.quic() {
+        quic.early_secret(Some(secret));
+    }
+
+    output.send().set_encrypter(encrypter);
 
     output.output(OutputEvent::EarlyExporter(
         early_key_schedule.early_exporter(&client_hello_hash, key_log, client_random),
@@ -598,9 +616,11 @@ impl State<ClientSide> for ExpectEncryptedExtensions {
                         None => {
                             output.emit(Event::EarlyData(EarlyDataEvent::Rejected));
                             // If no early traffic, set the encryption key for handshakes
-                            self.hs
-                                .key_schedule
-                                .set_handshake_encrypter(output.send());
+                            output.send().set_encrypter(
+                                self.hs
+                                    .key_schedule
+                                    .handshake_encrypter(),
+                            );
                             self.in_early_traffic = false;
                         }
                     }
@@ -1368,9 +1388,9 @@ impl State<ClientSide> for ExpectFinished {
         if st.in_early_traffic {
             emit_end_of_early_data_tls13(&mut st.hs.transcript, output)?;
             output.emit(Event::EarlyData(EarlyDataEvent::Finished));
-            st.hs
-                .key_schedule
-                .set_handshake_encrypter(output.send());
+            output
+                .send()
+                .set_encrypter(st.hs.key_schedule.handshake_encrypter());
         }
 
         let mut flight = HandshakeFlightTls13::new(&mut st.hs.transcript);
@@ -1426,6 +1446,13 @@ impl State<ClientSide> for ExpectFinished {
         emit_finished_tls13(&mut flight, &verify_data);
         flight.finish(output)?;
 
+        // Remember what KX group the server liked for next time.
+        st.hs
+            .config
+            .resumption
+            .store
+            .set_kx_hint(st.hs.session_key.clone(), st.hs.kx_group);
+
         /* We're now sure this server supports TLS1.3.  But if we run out of TLS1.3 tickets
          * when connecting to it again, we definitely don't want to attempt a TLS1.2 resumption. */
         st.hs
@@ -1435,8 +1462,24 @@ impl State<ClientSide> for ExpectFinished {
             .remove_tls12_session(&st.hs.session_key);
 
         /* Now move to our application traffic keys. */
-        let (key_schedule, exporter, resumption) =
-            key_schedule_pre_finished.into_traffic(output, st.hs.transcript.current_hash(), &proof);
+        let ClientTrafficSecrets {
+            key_schedule,
+            exporter,
+            resumption,
+            decrypter,
+            encrypter,
+            quic: quic_secrets,
+        } = key_schedule_pre_finished.into_traffic(st.hs.transcript.current_hash());
+
+        output
+            .receive()
+            .decrypt_state
+            .set_record_decrypter(decrypter, &proof);
+        output.send().set_encrypter(encrypter);
+
+        if let (Some(quic), Some(update)) = (output.quic(), quic_secrets) {
+            quic.traffic_secrets(update);
+        }
         let (key_schedule_send, key_schedule_recv) = key_schedule.split();
 
         // Now that we've reached the end of the normal handshake we must enforce ECH acceptance by
@@ -1499,6 +1542,7 @@ struct HandshakeState {
     randoms: ConnectionRandoms,
     transcript: HandshakeHash,
     key_schedule: KeyScheduleHandshake,
+    kx_group: NamedGroup,
 }
 
 // -- Traffic transit state (TLS1.3) --

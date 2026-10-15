@@ -1061,7 +1061,6 @@ mod tests {
     use rustls::crypto::Identity;
     use rustls::crypto::kx::NamedGroup;
     use rustls::crypto::tls13::{Hkdf, HkdfUsingHmac};
-    use rustls::server::ServerConnection;
     use rustls::{Connection, RootCertStore, ServerConfig, VecInput};
     use rustls_test::{ErrorFromPeer, bytes_for, do_handshake, do_handshake_until_error};
     use std::eprintln;
@@ -1866,7 +1865,7 @@ mod tests {
             .connect(ServerName::try_from("example.com").unwrap())
             .build(&mut client_output)
             .unwrap();
-        let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
+        let mut server = Connection::new(Arc::new(server_config)).unwrap();
         do_handshake(
             &mut VecInput::default(),
             &mut client_output,
@@ -1959,7 +1958,7 @@ mod tests {
             u16::from_be_bytes([client_hello[3], client_hello[4]]) as usize;
         let client_hello_record = &client_hello[..5 + client_hello_record_len];
 
-        let mut target = ServerConnection::new(server_config.clone()).unwrap();
+        let mut target = Connection::new(server_config.clone()).unwrap();
         let mut target_input = VecInput::default();
         target_input
             .read(&mut Cursor::new(client_hello_record))
@@ -1978,7 +1977,7 @@ mod tests {
             .connect(ServerName::try_from("example.com").unwrap())
             .build(&mut client_output)
             .unwrap();
-        let mut server = ServerConnection::new(server_config.clone()).unwrap();
+        let mut server = Connection::new(server_config.clone()).unwrap();
         server
             .set_reality_server_hello_template(&target_server_hello)
             .unwrap();
@@ -2008,7 +2007,7 @@ mod tests {
             .connect(ServerName::try_from("example.com").unwrap())
             .build(&mut client_output)
             .unwrap();
-        let mut server = ServerConnection::new(server_config).unwrap();
+        let mut server = Connection::new(server_config).unwrap();
         server
             .set_reality_server_hello_template(&incompatible_template)
             .unwrap();
@@ -2058,7 +2057,7 @@ mod tests {
             .connect(ServerName::try_from("localhost").unwrap())
             .build(&mut client_output)
             .unwrap();
-        let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
+        let mut server = Connection::new(Arc::new(server_config)).unwrap();
 
         let err = do_handshake_until_error(
             &mut VecInput::default(),

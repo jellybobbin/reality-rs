@@ -1224,6 +1224,7 @@ pub enum PeerMisbehaved {
     ResumptionOfferedWithVariedEms,
     ResumptionOfferedWithIncompatibleCipherSuite,
     SelectedDifferentCipherSuiteAfterRetry,
+    SelectedDifferentProtocolVersionAfterRetry,
     SelectedInvalidPsk,
     SelectedTls12UsingTls13VersionExtension,
     SelectedUnofferedApplicationProtocol,
@@ -1681,10 +1682,10 @@ pub enum ApiMisuse {
         maximum: usize,
     },
 
-    /// Calling [`ServerConnection::set_resumption_data()`] must be done before
+    /// Calling [`Connection::set_resumption_data()`] must be done before
     /// any resumption is offered.
     ///
-    /// [`ServerConnection::set_resumption_data()`]: crate::server::ServerConnection::set_resumption_data()
+    /// [`Connection::set_resumption_data()`]: crate::Connection::set_resumption_data()
     ResumptionDataProvidedTooLate,
 
     /// A [`ClientHelloCallback`][crate::client::ClientHelloCallback] tried to set a
@@ -1721,10 +1722,7 @@ pub enum ApiMisuse {
     /// [`KernelConnection::handle_new_session_ticket()`]: crate::conn::kernel::KernelConnection::handle_new_session_ticket()
     KernelSessionTicketHandlingNotAvailableForTls12,
 
-    /// [`ClientConnection::split()`] or [`ServerConnection::split()`] called during handshake.
-    ///
-    /// [`ServerConnection::split()`]: crate::server::ServerConnection::split()
-    /// [`ClientConnection::split()`]: crate::client::ClientConnection::split()
+    /// [`Connection::split()`][crate::Connection::split()] called during handshake.
     SplitDuringHandshake,
 
     /// An output buffer provided for encryption was too small.

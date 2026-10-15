@@ -22,7 +22,7 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use std::io::{Read, Write};
 
-use rustls::Connection;
+use rustls::SideData;
 use rustls_util::StreamOwned;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
@@ -71,7 +71,8 @@ pub struct BridgeStream {
 /// usable as `Box<dyn AsyncReadWrite>`.
 pub fn into_async<C>(tls: StreamOwned<C, std::net::TcpStream>) -> std::io::Result<BridgeStream>
 where
-    C: Connection + Send + 'static,
+    C: SideData + 'static,
+    StreamOwned<C, std::net::TcpStream>: Send,
 {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(INBOUND_CHANNEL_CAP);
     let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CHANNEL_CAP);
@@ -95,7 +96,8 @@ fn pump<C>(
     mut outbound_rx: mpsc::Receiver<Vec<u8>>,
 ) -> std::io::Result<()>
 where
-    C: Connection + Send + 'static,
+    C: SideData + 'static,
+    StreamOwned<C, std::net::TcpStream>: Send,
 {
     // Blocking socket with short read/write timeouts: the worker parks in the
     // kernel while idle instead of busy-polling, and a timeout simply surfaces

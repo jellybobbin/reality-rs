@@ -14,7 +14,7 @@ use crate::builder::{ConfigBuilder, WantsVerifier};
 use crate::common_state::Protocol;
 #[cfg(doc)]
 use crate::crypto;
-use crate::crypto::kx::NamedGroup;
+use crate::crypto::kx::{NamedGroup, SupportedKxGroup};
 use crate::crypto::{
     CipherSuite, CryptoProvider, SelectedCredential, SignatureScheme, TicketProducer,
 };
@@ -37,19 +37,6 @@ use crate::{KeyLog, NoKeyLog, Tls12CipherSuite, Tls13CipherSuite, compress};
 ///
 /// These must be created via the [`ServerConfig::builder()`] or [`ServerConfig::builder_with_details()`]
 /// function.
-///
-/// # Defaults
-///
-/// * [`ServerConfig::max_fragment_size`]: the default is `None` (meaning 16kB).
-/// * [`ServerConfig::session_storage`]: if the `std` feature is enabled, the default stores 256
-///   sessions in memory. If the `std` feature is not enabled, the default is to not store any
-///   sessions.
-/// * [`ServerConfig::alpn_protocols`]: the default is empty -- no ALPN protocol is negotiated.
-/// * [`ServerConfig::key_log`]: key material is not logged.
-/// * [`ServerConfig::send_tls13_tickets`]: 2 tickets are sent, with a maximum of 2.
-/// * [`ServerConfig::cert_compressors`]: depends on the crate features, see [`compress::default_cert_compressors()`].
-/// * [`ServerConfig::cert_compression_cache`]: caches the most recently used 4 compressions
-/// * [`ServerConfig::cert_decompressors`]: depends on the crate features, see [`compress::default_cert_decompressors()`].
 ///
 /// # Sharing resumption storage between `ServerConfig`s
 ///
@@ -84,28 +71,41 @@ pub struct ServerConfig {
     pub(crate) provider: Arc<CryptoProvider>,
 
     /// How to select a cipher suite to use for a TLS session.
+    ///
+    /// The default is [`PreferClientOrder`].
     pub cipher_suite_selector: &'static dyn CipherSuiteSelector,
 
+    /// How to select a key exchange group to use for a TLS connection.
+    ///
+    /// The default is [`PreferClientOrder`].
+    pub kx_selector: &'static dyn KeyExchangeSelector,
+
     /// The maximum size of plaintext input to be emitted in a single TLS record.
-    /// A value of None is equivalent to the [TLS maximum] of 16 kB.
+    /// A value of None is equivalent to the [TLS maximum] of 16 kB, and this is
+    /// the default.
     ///
     /// rustls enforces an arbitrary minimum of 32 bytes for this field.
-    /// Out of range values are reported as errors from [ServerConnection::new].
+    /// Out of range values are reported as errors from [Connection::new].
     ///
     /// Setting this value to a little less than the TCP MSS may improve latency
     /// for stream-y workloads.
     ///
     /// [TLS maximum]: https://datatracker.ietf.org/doc/html/rfc9846#section-5.1
-    /// [ServerConnection::new]: crate::server::ServerConnection::new
+    /// [Connection::new]: crate::Connection::new
     pub max_fragment_size: Option<usize>,
 
     /// How to store client sessions.
+    ///
+    /// The default stores 256 sessions in memory.
     ///
     /// See [ServerConfig#sharing-resumption-storage-between-serverconfigs]
     /// for a warning related to this field.
     pub session_storage: Arc<dyn StoresServerSessions>,
 
     /// How to produce tickets.
+    ///
+    /// The default is `None` which means ticket-based resumption in TLS1.2 and stateless resumption
+    /// in TLS1.3 are not available.
     ///
     /// See [ServerConfig#sharing-resumption-storage-between-serverconfigs]
     /// for a warning related to this field.
@@ -116,7 +116,8 @@ pub struct ServerConfig {
     pub cert_resolver: Arc<dyn ServerCredentialResolver>,
 
     /// Protocol names we support, most preferred first.
-    /// If empty we don't do ALPN at all.
+    ///
+    /// If empty we don't do ALPN at all.  This is the default.
     pub alpn_protocols: Vec<ApplicationProtocol<'static>>,
 
     /// How to verify client certificates.
@@ -125,8 +126,11 @@ pub struct ServerConfig {
     /// Optional verifier for raw client hello policy checks before certificate selection.
     pub(super) client_hello_verifier: Option<Arc<dyn ClientHelloVerifier>>,
 
-    /// How to output key material for debugging.  The default
-    /// does nothing.
+    /// How to output key material for debugging.
+    ///
+    /// The default does nothing and so key material is not logged.
+    ///
+    /// See [RFC 9850](https://datatracker.ietf.org/doc/html/rfc9850) for background.
     pub key_log: Arc<dyn KeyLog>,
 
     /// Allows traffic secrets to be extracted after the handshake,
@@ -174,6 +178,8 @@ pub struct ServerConfig {
     /// Because TLS1.3 tickets are single-use, this allows
     /// a client to perform multiple resumptions.
     ///
+    /// The default means 2 tickets are sent, with a maximum of 2.
+    ///
     /// See [`Tls13Tickets`] for the meaning of the default and maximum
     /// counts.
     pub send_tls13_tickets: Tls13Tickets,
@@ -204,6 +210,8 @@ pub struct ServerConfig {
     /// This only applies to TLS1.3 connections.  It is ignored for
     /// TLS1.2 connections.
     ///
+    /// The default depends on the crate features, see [`compress::default_cert_compressors()`].
+    ///
     /// [RFC 8879]: https://datatracker.ietf.org/doc/rfc8879/
     pub cert_compressors: Vec<&'static dyn compress::CertCompressor>,
 
@@ -211,6 +219,8 @@ pub struct ServerConfig {
     ///
     /// This is optional: [`compress::CompressionCache::Disabled`] gives
     /// a cache that does no caching.
+    ///
+    /// The default caches the most recently used 4 compressions.
     pub cert_compression_cache: Arc<compress::CompressionCache>,
 
     /// How to decompress the clients's certificate chain.
@@ -223,10 +233,14 @@ pub struct ServerConfig {
     /// This only applies to TLS1.3 connections.  It is ignored for
     /// TLS1.2 connections.
     ///
+    /// The default depends on the crate features, see [`compress::default_cert_decompressors()`].
+    ///
     /// [RFC 8879]: https://datatracker.ietf.org/doc/rfc8879/
     pub cert_decompressors: Vec<&'static dyn compress::CertDecompressor>,
 
     /// Policy for how an invalid Server Name Indication (SNI) value from a client is handled.
+    ///
+    /// The default rejects IP addresses in SNI extensions, which is mandated behaviour.
     pub invalid_sni_policy: InvalidSniPolicy,
 }
 
@@ -763,6 +777,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
         Ok(ServerConfig {
             provider: self.provider,
             cipher_suite_selector: &PreferClientOrder,
+            kx_selector: &PreferClientOrder,
             max_fragment_size: None,
             session_storage: handy::ServerSessionMemoryCache::new(256),
             ticketer: None,
@@ -785,10 +800,20 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
     }
 }
 
-/// A [`CipherSuiteSelector`] implementation that prioritizes client order.
+/// A [`KeyExchangeSelector`]/[`CipherSuiteSelector`] implementation that prioritizes client order.
 #[expect(clippy::exhaustive_structs)]
 #[derive(Debug)]
 pub struct PreferClientOrder;
+
+impl KeyExchangeSelector for PreferClientOrder {
+    fn select_key_exchange(
+        &self,
+        client: &mut dyn Iterator<Item = OfferedKxGroup>,
+        _server: &[&'static dyn SupportedKxGroup],
+    ) -> Option<&'static dyn SupportedKxGroup> {
+        client.next().map(|c| c.group)
+    }
+}
 
 impl CipherSuiteSelector for PreferClientOrder {
     fn select_tls12_cipher_suite(
@@ -854,10 +879,28 @@ impl PreferClientOrder {
     }
 }
 
-/// A [`CipherSuiteSelector`] implementation that prioritizes server order.
+/// A [`KeyExchangeSelector`]/[`CipherSuiteSelector`] implementation that prioritizes server order.
 #[expect(clippy::exhaustive_structs)]
 #[derive(Debug)]
 pub struct PreferServerOrder;
+
+impl KeyExchangeSelector for PreferServerOrder {
+    fn select_key_exchange(
+        &self,
+        client: &mut dyn Iterator<Item = OfferedKxGroup>,
+        server: &[&'static dyn SupportedKxGroup],
+    ) -> Option<&'static dyn SupportedKxGroup> {
+        client
+            .filter_map(|offered| {
+                server
+                    .iter()
+                    .position(|ss| ss.name() == offered.group.name())
+                    .map(|pos| (pos, offered.group))
+            })
+            .min_by_key(|&(pos, _)| pos)
+            .map(|(_, group)| group)
+    }
+}
 
 impl CipherSuiteSelector for PreferServerOrder {
     fn select_tls12_cipher_suite(
@@ -950,4 +993,48 @@ pub trait CipherSuiteSelector: Debug + Send + Sync {
         client: &mut dyn Iterator<Item = &'static Tls13CipherSuite>,
         server: &[&'static Tls13CipherSuite],
     ) -> Option<&'static Tls13CipherSuite>;
+}
+
+/// Chooses the key exchange group for a TLS connection.
+pub trait KeyExchangeSelector: Debug + Send + Sync {
+    /// Choose a key exchange group, given the client's and server's options.
+    ///
+    /// `client` holds the groups from the client's `supported_groups` extension, in the
+    /// client's order, filtered to those the server supports and that suit the protocol
+    /// version and the selected cipher suite. `server` is the [`CryptoProvider`]'s
+    /// `kx_groups`, in preference order.
+    ///
+    /// If the chosen group has no key share (see [`OfferedKxGroup::has_key_share`]),
+    /// a TLS 1.3 server sends a HelloRetryRequest for it.
+    ///
+    /// Returns `None` if no acceptable group is offered. The result must come from
+    /// `client`.
+    fn select_key_exchange(
+        &self,
+        client: &mut dyn Iterator<Item = OfferedKxGroup>,
+        server: &[&'static dyn SupportedKxGroup],
+    ) -> Option<&'static dyn SupportedKxGroup>;
+}
+
+/// A key exchange group offered by the client.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug)]
+pub struct OfferedKxGroup {
+    /// The group, as implemented by the server's provider.
+    pub group: &'static dyn SupportedKxGroup,
+
+    /// Whether the client sent a key share for this group.
+    ///
+    /// Always `false` for TLS 1.2.
+    pub has_key_share: bool,
+}
+
+impl OfferedKxGroup {
+    /// Creates a new [`OfferedKxGroup`]
+    pub const fn new(group: &'static dyn SupportedKxGroup, has_key_share: bool) -> Self {
+        Self {
+            group,
+            has_key_share,
+        }
+    }
 }
