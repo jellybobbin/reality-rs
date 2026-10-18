@@ -1,11 +1,17 @@
 [reality]
-shortIds = ["aabbcc"]
-privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"
+short_ids = ["aabbcc"]
+private_key = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"
 version = "010203"
-serverNames = ["example.com"]
+server_names = ["example.com"]
 
 [anytls]
 password = "reality-smoke-password"
 
 [server]
 listen = "127.0.0.1:9445"
+
+# [panel_sync]
+# webapi_url = "https://panel.example/api"
+# webapi_token = "your-token"
+# node_id = 7
+# update_interval_secs = 60

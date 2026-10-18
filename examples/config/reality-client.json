@@ -1,8 +1,8 @@
 {
     "reality": {
-        "shortId": "aabbcc",
-        "publicKey": "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg",
-        "serverName": "test",
+        "short_id": "aabbcc",
+        "public_key": "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg",
+        "server_name": "test",
         "version": "010203"
     }
 }

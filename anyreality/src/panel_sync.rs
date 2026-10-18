@@ -148,7 +148,7 @@ impl PanelSync {
         if !config.is_configured() {
             match (config.webapi_url, config.webapi_token, config.node_id) {
                 (None, None, None) => return Ok(None),
-                _ => anyhow::bail!("panelSync.webapi_url, panelSync.webapi_token, and panelSync.node_id must be set together"),
+                _ => anyhow::bail!("panel_sync.webapi_url, panel_sync.webapi_token, and panel_sync.node_id must be set together"),
             }
         }
         Ok(Some(config))

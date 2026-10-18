@@ -1,17 +1,14 @@
 [reality]
-shortId = "aabbcc"
-publicKey = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"
+short_id = "aabbcc"
+public_key = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"
 version = "010203"
-serverName = "example.com"
-# clientHelloProfile = "chrome" # chrome, firefox, safari, or default
+server_name = "example.com"
+# client_hello_profile = "chrome" # chrome, firefox, safari, or default
 
 [anytls]
-# clientId = null
+# client_id = "e54b0085-6757-4950-a18f-4925b4dd662a"
 password = "reality-smoke-password"
-idleCheckSecs = 30
-idleTimeoutSecs = 30
-minIdleSessions = 5
 
 [client]
 listen = "mixed://127.0.0.1:1081"
-serverAddr = "127.0.0.1:9445"
+server_addr = "127.0.0.1:9445"

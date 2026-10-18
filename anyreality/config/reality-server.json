@@ -1,9 +1,9 @@
 {
     "reality": {
-        "shortIds": ["aabbcc"],
-        "privateKey": "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM",
+        "short_ids": ["aabbcc"],
+        "private_key": "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM",
         "version": "010203",
-        "serverNames": [
+        "server_names": [
             "example.com"
         ]
     },

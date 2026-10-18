@@ -34,9 +34,9 @@
 - 服务端在很早阶段读取 `ClientHello`，决定是继续 REALITY/TLS 路径，还是转发到 decoy 后端。
 - `tls-server-mio` 会将原始 `ClientHello` 发给规则选中的 fallback 后端，异步采样其 TLS 1.3 ServerHello；认证成功时保留目标 ServerHello 的原始编码、扩展顺序和 random，只替换 session_id 与本地 ECDH key_share。
 - decoy 转发可以按规则匹配，例如：
-  - `serverNames`
+  - `server_names`
   - `alpns`
-  - `namedGroups`
+  - `named_groups`
 - 配置可以通过 CLI 或 JSON/TOML 文件加载。
 
 ### 还没做到什么
@@ -175,13 +175,13 @@
 
 #### 第一层：规则选路
 
-服务端先根据配置里的 `fallbackRules` 和默认 fallback target 决定“如果要回退，目标是谁”。
+服务端先根据配置里的 `fallback_rules` 和默认 fallback target 决定“如果要回退，目标是谁”。
 
 当前 matcher 支持：
 
-- `serverNames`
+- `server_names`
 - `alpns`
-- `namedGroups`
+- `named_groups`
 
 对应关键逻辑在：
 
@@ -255,19 +255,19 @@
 - `shortId`
   - 客户端：`--reality-short-id`
   - 服务端：`--reality-short-id`
-  - 配置：`reality.shortId`
+  - 本项目配置：`reality.short_id`
 - `publicKey`
   - 客户端：`--reality-public-key`
-  - 配置：`reality.publicKey`
+  - 本项目配置：`reality.public_key`
   - 含义：客户端持有服务端静态公钥，用来生成 REALITY `session_id`
 - `privateKey`
   - 服务端：`--reality-private-key`
-  - 配置：`reality.privateKey`
+  - 本项目配置：`reality.private_key`
   - 含义：服务端持有对应静态私钥，用来验证 REALITY hello
 - `serverName`
   - 客户端：`--server-name`
   - 服务端：`--reality-server-name`
-  - 配置：`reality.serverName` 或 `reality.serverNames`
+  - 本项目配置：`reality.server_name` 或 `reality.server_names`
   - 含义：既是 TLS SNI 相关字段，也是当前 allowlist 决策的一部分
 - `version`
   - 客户端和服务端都要求显式给出
@@ -293,12 +293,12 @@
 
 于是当前实现逐步演化出：
 
-- 默认 `fallbackAddress + fallbackPort`
-- 有序 `fallbackRules`
+- 默认 `fallback_address + fallback_port`
+- 有序 `fallback_rules`
 - 规则 matcher 支持：
-  - `serverNames`
+  - `server_names`
   - `alpns`
-  - `namedGroups`
+  - `named_groups`
 - 规则校验：
   - 至少要有一个 matcher
   - 端口不能为 0

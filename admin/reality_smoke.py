@@ -242,10 +242,10 @@ Examples:
     with open(server_config_path, 'w', encoding='utf-8') as handle:
         handle.write(
             '[reality]\n'
-            'shortIds = ["aabbcc"]\n'
-            'privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"\n'
+            'short_ids = ["aabbcc"]\n'
+            'private_key = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"\n'
             'version = "010203"\n'
-            'serverNames = ["localhost", "www.baidu.com"]\n\n'
+            'server_names = ["localhost", "www.baidu.com"]\n\n'
             '[anytls]\n'
             'password = "reality-smoke-password"\n\n'
             '[server]\n'
@@ -255,18 +255,18 @@ Examples:
     with open(client_config_path, 'w', encoding='utf-8') as handle:
         handle.write(
             '[reality]\n'
-            'shortId = "aabbcc"\n'
-            'publicKey = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"\n'
-            'serverName = "localhost"\n'
+            'short_id = "aabbcc"\n'
+            'public_key = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"\n'
+            'server_name = "localhost"\n'
             'version = "010203"\n\n'
             '[anytls]\n'
             'password = "reality-smoke-password"\n'
-            'idleCheckSecs = 30\n'
-            'idleTimeoutSecs = 30\n'
-            'minIdleSessions = 5\n\n'
+            'idle_check_secs = 30\n'
+            'idle_timeout_secs = 30\n'
+            'min_idle_sessions = 5\n\n'
             '[client]\n'
             f'listen = "mixed://{client_listen}"\n'
-            f'serverAddr = "{server_listen}"\n'
+            f'server_addr = "{server_listen}"\n'
         )
 
     entries = []

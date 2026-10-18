@@ -144,9 +144,9 @@ generate_anytls_password() {
 generate_reality_keys() {
   printf 'Generating REALITY keys (using %s)\n' "$BIN_DIR/$BIN_FILE"
   keys_out=$("$BIN_DIR/$BIN_FILE" --gen-reality-keys 2>/dev/null || true)
-  priv=$(echo "$keys_out" | sed -n 's/^privateKey:[[:space:]]*//p' | tr -d '\r')
-  pub=$(echo "$keys_out" | sed -n 's/^publicKey:[[:space:]]*//p' | tr -d '\r')
-  shortid=$(echo "$keys_out" | sed -n 's/^shortId:[[:space:]]*//p' | tr -d '\r')
+  priv=$(echo "$keys_out" | sed -n 's/^private_key:[[:space:]]*//p' | tr -d '\r')
+  pub=$(echo "$keys_out" | sed -n 's/^public_key:[[:space:]]*//p' | tr -d '\r')
+  shortid=$(echo "$keys_out" | sed -n 's/^short_id:[[:space:]]*//p' | tr -d '\r')
   if [ -z "$pub" ] || [ -z "$priv" ] || [ -z "$shortid" ]; then
     printf 'Failed to generate REALITY keys; output:\n%s\n' "$keys_out" >&2
     return 1
@@ -159,10 +159,10 @@ write_server_config() {
   local password="$3"
   cat > "$SERVER_CONFIG" <<EOF
 [reality]
-shortIds = ["$shortid"]
-privateKey = "$priv"
+short_ids = ["$shortid"]
+private_key = "$priv"
 version = "010203"
-serverNames = ["$the_site"]
+server_names = ["$the_site"]
 
 [anytls]
 password = "$password"
@@ -180,17 +180,17 @@ write_client_config() {
   local hostaddr=$(resolve_hostaddr)
   cat > "${CLIENT_CONFIG}" <<EOF
 [reality]
-shortId = "$shortid"
-publicKey = "$pub"
+short_id = "$shortid"
+public_key = "$pub"
 version = "010203"
-serverName = "$the_site"
+server_name = "$the_site"
 
 [anytls]
 password = "$password"
 
 [client]
 listen = "mixed://127.0.0.1:2080"
-serverAddr = "${hostaddr}:${the_port}"
+server_addr = "${hostaddr}:${the_port}"
 EOF
   echo -e "${Green}Wrote client config: ${CLIENT_CONFIG}${ColorOff}"
 }

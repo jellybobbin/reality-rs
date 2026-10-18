@@ -71,7 +71,7 @@ struct Args {
     #[arg(long, value_name = "URI")]
     listen: Option<ProxyParameters>,
 
-    /// Override client.serverAddr from the config file. Accepts IP or hostname, for example "127.0.0.1:1080" and "mysite.com:6789".
+    /// Override client.server_addr from the config file. Accepts IP or hostname, for example "127.0.0.1:1080" and "mysite.com:6789".
     #[arg(short, long, value_name = "ADDR")]
     server_addr: Option<Address>,
 
@@ -81,7 +81,6 @@ struct Args {
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ClientConfigFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reality: Option<ClientRealityConfig>,
@@ -92,7 +91,6 @@ struct ClientConfigFile {
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ClientRealityConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     public_key: Option<String>,
@@ -107,7 +105,6 @@ struct ClientRealityConfig {
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ClientAnytlsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     password: Option<String>,
@@ -123,7 +120,6 @@ struct ClientAnytlsConfig {
 
 /// The runtime configuration for the client, including listen address, server address, and optional probe proxy.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ClientRuntimeConfig {
     /// The local address and parameters to listen on for incoming connections.
     /// The value looks like `mixed://127.0.0.1:8080`, where the scheme can be `socks5`, `http`, or `mixed`.
@@ -525,7 +521,7 @@ mod client_listener_tests {
         ])
         .unwrap();
         let mut config: ClientConfigFile = toml::from_str(
-            "[anytls]\npassword = 'config-password'\n\n[client]\nlisten = 'mixed://127.0.0.1:1080'\nserverAddr = '127.0.0.1:9445'\nprobeProxy = '127.0.0.1:8080'\n",
+            "[anytls]\npassword = 'config-password'\n\n[client]\nlisten = 'mixed://127.0.0.1:1080'\nserver_addr = '127.0.0.1:9445'\nprobe_proxy = '127.0.0.1:8080'\n",
         )
         .unwrap();
         let no_overrides = Args::try_parse_from(["anyreality-client", "--config", "unused.toml"]).unwrap();
@@ -555,8 +551,8 @@ mod client_listener_tests {
 
     #[test]
     fn server_addr_accepts_domain_names_in_toml_and_json() {
-        let toml: ClientRuntimeConfig = toml::from_str("serverAddr = 'mysite.com:6789'").unwrap();
-        let json: ClientRuntimeConfig = serde_json::from_str(r#"{"serverAddr":"mysite.com:6789"}"#).unwrap();
+        let toml: ClientRuntimeConfig = toml::from_str("server_addr = 'mysite.com:6789'").unwrap();
+        let json: ClientRuntimeConfig = serde_json::from_str(r#"{"server_addr":"mysite.com:6789"}"#).unwrap();
         let expected = Some(Address::from(("mysite.com", 6789)));
 
         assert_eq!(toml.server_addr, expected);
@@ -755,7 +751,7 @@ fn resolve_client_config(config_path: &Path, args: &Args) -> Result<ClientConfig
     client
         .server_addr
         .as_ref()
-        .ok_or_else(|| anyhow!("client.serverAddr must be set in config or with --server-addr"))?;
+        .ok_or_else(|| anyhow!("client.server_addr must be set in config or with --server-addr"))?;
     let password = anytls
         .password
         .as_deref()
@@ -769,11 +765,11 @@ fn resolve_client_config(config_path: &Path, args: &Args) -> Result<ClientConfig
     reality
         .short_id
         .as_ref()
-        .ok_or_else(|| anyhow!("reality.shortId must be set in config"))?;
+        .ok_or_else(|| anyhow!("reality.short_id must be set in config"))?;
     reality
         .public_key
         .as_ref()
-        .ok_or_else(|| anyhow!("reality.publicKey must be set in config"))?;
+        .ok_or_else(|| anyhow!("reality.public_key must be set in config"))?;
     reality
         .version
         .as_ref()
@@ -781,13 +777,13 @@ fn resolve_client_config(config_path: &Path, args: &Args) -> Result<ClientConfig
     reality
         .server_name
         .as_ref()
-        .ok_or_else(|| anyhow!("reality.serverName must be set in config"))?;
+        .ok_or_else(|| anyhow!("reality.server_name must be set in config"))?;
     match reality.client_hello_profile.as_deref() {
         None | Some(DEFAULT_CLIENT_HELLO_PROFILE) => ClientHelloProfile::Default,
         Some("chrome") => ClientHelloProfile::Chrome,
         Some("firefox") => ClientHelloProfile::Firefox,
         Some("safari") => ClientHelloProfile::Safari,
-        Some(value) => bail!("unsupported reality.clientHelloProfile: {value}"),
+        Some(value) => bail!("unsupported reality.client_hello_profile: {value}"),
     };
 
     if let Some(anytls) = file_config.anytls.as_mut() {
@@ -828,10 +824,10 @@ fn build_rustls_client_config(args: &ClientRealityConfig) -> Result<rustls::Clie
         ),
         args.short_id
             .as_deref()
-            .ok_or_else(|| anyhow!("reality.shortId must be set in config"))?,
+            .ok_or_else(|| anyhow!("reality.short_id must be set in config"))?,
         args.public_key
             .as_deref()
-            .ok_or_else(|| anyhow!("reality.publicKey must be set in config"))?,
+            .ok_or_else(|| anyhow!("reality.public_key must be set in config"))?,
         root_store,
     )?;
 
@@ -844,7 +840,7 @@ fn build_rustls_client_config(args: &ClientRealityConfig) -> Result<rustls::Clie
         Some("chrome") => ClientHelloProfile::Chrome,
         Some("firefox") => ClientHelloProfile::Firefox,
         Some("safari") => ClientHelloProfile::Safari,
-        Some(value) => bail!("unsupported reality.clientHelloProfile: {value}"),
+        Some(value) => bail!("unsupported reality.client_hello_profile: {value}"),
     };
 
     Ok(config)

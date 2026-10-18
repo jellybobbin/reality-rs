@@ -72,7 +72,7 @@ struct Args {
     #[arg(short, long, value_name = "FILE")]
     config: Option<PathBuf>,
 
-    /// Generate an X25519 REALITY keypair (prints privateKey base64url and shortId hex) and exit
+    /// Generate an X25519 REALITY keypair (prints private_key base64url and short_id hex) and exit
     #[arg(short, long)]
     gen_reality_keys: bool,
 
@@ -82,7 +82,6 @@ struct Args {
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ServerConfigFile {
     #[serde(default)]
     reality: Option<ServerRealityConfigFile>,
@@ -95,7 +94,6 @@ struct ServerConfigFile {
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ServerRealityConfigFile {
     #[serde(default)]
     private_key: Option<String>,
@@ -108,14 +106,12 @@ struct ServerRealityConfigFile {
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ServerAnytlsConfigFile {
     #[serde(default)]
     password: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ServerRuntimeConfigFile {
     #[serde(default)]
     listen: Option<SocketAddr>,
@@ -584,7 +580,7 @@ fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
     let private_key = reality
         .private_key
         .clone()
-        .ok_or_else(|| anyhow::anyhow!("reality.privateKey must be set in config"))?;
+        .ok_or_else(|| anyhow::anyhow!("reality.private_key must be set in config"))?;
     let version = reality
         .version
         .clone()
@@ -593,9 +589,9 @@ fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
     let server_names = reality
         .server_names
         .clone()
-        .ok_or_else(|| anyhow::anyhow!("reality.serverNames must be set for fallback"))?;
+        .ok_or_else(|| anyhow::anyhow!("reality.server_names must be set for fallback"))?;
     if server_names.is_empty() {
-        bail!("reality.serverNames must not be empty for fallback");
+        bail!("reality.server_names must not be empty for fallback");
     }
     Ok(ServerConfigResolved {
         listen,
@@ -731,10 +727,10 @@ fn generate_reality_keypair() -> Result<()> {
     let raw_priv: Curve25519SeedBin<'_> = priv_key.as_be_bytes().context("extract private key bytes")?;
     let priv_bytes = raw_priv.as_ref();
 
-    // base64url no-padding privateKey (Xray style)
+    // base64url no-padding private_key (Xray style)
     let private_b64url = URL_SAFE_NO_PAD.encode(priv_bytes);
 
-    // shortId = first 8 bytes of SHA256(public_key)
+    // short_id = first 8 bytes of SHA256(public_key)
     let digest = Sha256::digest(pub_key.as_ref());
     let short_id = &digest[..8];
     let mut shorthex = String::with_capacity(16);
@@ -743,12 +739,12 @@ fn generate_reality_keypair() -> Result<()> {
         write!(&mut shorthex, "{:02x}", b).ok();
     }
 
-    // publicKey: base64url no padding (Xray-style) for client config
+    // public_key: base64url no padding (Xray-style) for client config
     let public_b64url = URL_SAFE_NO_PAD.encode(pub_key.as_ref());
 
-    println!("privateKey: {}", private_b64url);
-    println!("publicKey: {}", public_b64url);
-    println!("shortId: {}", shorthex);
+    println!("private_key: {}", private_b64url);
+    println!("public_key: {}", public_b64url);
+    println!("short_id: {}", shorthex);
     Ok(())
 }
 
@@ -841,10 +837,10 @@ fn parse_server_short_ids(reality: &ServerRealityConfigFile) -> Result<Vec<Vec<u
     let configured_short_ids = reality
         .short_ids
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("reality.shortIds must be set in config"))?;
+        .ok_or_else(|| anyhow::anyhow!("reality.short_ids must be set in config"))?;
 
     if configured_short_ids.is_empty() {
-        bail!("reality.shortIds must not be empty");
+        bail!("reality.short_ids must not be empty");
     }
 
     configured_short_ids
@@ -900,13 +896,13 @@ mod tests {
 
     #[test]
     fn server_short_ids_accepts_toml_and_json_arrays() {
-        let array: ServerRealityConfigFile = toml::from_str("shortIds = [\"aabbcc\", \"1122\"]").unwrap();
+        let array: ServerRealityConfigFile = toml::from_str("short_ids = [\"aabbcc\", \"1122\"]").unwrap();
         assert_eq!(
             parse_server_short_ids(&array).unwrap(),
             vec![vec![0xaa, 0xbb, 0xcc], vec![0x11, 0x22]]
         );
 
-        let json: ServerRealityConfigFile = serde_json::from_str(r#"{"shortIds":["aabbcc","1122"]}"#).unwrap();
+        let json: ServerRealityConfigFile = serde_json::from_str(r#"{"short_ids":["aabbcc","1122"]}"#).unwrap();
         assert_eq!(
             parse_server_short_ids(&json).unwrap(),
             vec![vec![0xaa, 0xbb, 0xcc], vec![0x11, 0x22]]
@@ -918,16 +914,13 @@ mod tests {
         let missing: ServerRealityConfigFile = toml::from_str("").unwrap();
         assert!(parse_server_short_ids(&missing).is_err());
 
-        let legacy: ServerRealityConfigFile = toml::from_str("shortId = \"aabbcc\"").unwrap();
-        assert!(parse_server_short_ids(&legacy).is_err());
-
-        let empty: ServerRealityConfigFile = toml::from_str("shortIds = []").unwrap();
+        let empty: ServerRealityConfigFile = toml::from_str("short_ids = []").unwrap();
         assert!(parse_server_short_ids(&empty).is_err());
 
-        let too_long: ServerRealityConfigFile = toml::from_str("shortIds = [\"001122334455667788\"]").unwrap();
+        let too_long: ServerRealityConfigFile = toml::from_str("short_ids = [\"001122334455667788\"]").unwrap();
         assert!(parse_server_short_ids(&too_long).is_err());
 
-        let invalid_hex: ServerRealityConfigFile = toml::from_str("shortIds = [\"zz\"]").unwrap();
+        let invalid_hex: ServerRealityConfigFile = toml::from_str("short_ids = [\"zz\"]").unwrap();
         assert!(parse_server_short_ids(&invalid_hex).is_err());
     }
 
@@ -935,7 +928,7 @@ mod tests {
     fn panel_sync_config_uses_anytls_schema_and_rejects_partial_settings() {
         let toml: ServerConfigFile = toml::from_str(
             r#"
-    [panelSync]
+    [panel_sync]
 webapi_url = "https://panel.example/api"
 webapi_token = "secret"
 node_id = 7
@@ -949,11 +942,11 @@ update_interval_secs = 12
         assert_eq!(resolved.update_interval_secs, Some(12));
 
         let json: ServerConfigFile =
-            serde_json::from_str(r#"{"panelSync":{"webapi_url":"https://panel.example/api","webapi_token":"secret","node_id":7}}"#)
+            serde_json::from_str(r#"{"panel_sync":{"webapi_url":"https://panel.example/api","webapi_token":"secret","node_id":7}}"#)
                 .unwrap();
         assert!(PanelSync::resolve_config(json.panel_sync).unwrap().is_some());
 
-        let partial: ServerConfigFile = toml::from_str("[panelSync]\nwebapi_url = \"https://panel.example/api\"").unwrap();
+        let partial: ServerConfigFile = toml::from_str("[panel_sync]\nwebapi_url = \"https://panel.example/api\"").unwrap();
         assert!(PanelSync::resolve_config(partial.panel_sync).is_err());
         assert!(PanelSync::resolve_config(None).unwrap().is_none());
     }

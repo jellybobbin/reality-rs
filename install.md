@@ -36,27 +36,27 @@ bash <(curl -Ls https://raw.githubusercontent.com/ssrlive/reality-rs/main/instal
 ==== Client config (/etc/anyreality/client-config.toml) ====
 
 [reality]
-# shortId: 8-byte hex string (16 hex chars)
-shortId = "373ea..."
-# publicKey (base64url no-padding) — client may need server public for some flows
-publicKey = "Zr0WUF2_jkUH..."
+# short_id: 8-byte hex string (16 hex chars)
+short_id = "373ea..."
+# public_key (base64url no-padding) — client may need server public for some flows
+public_key = "Zr0WUF2_jkUH..."
 version = "010203"
-serverName = "cn.bing.com"
+server_name = "cn.bing.com"
 
 [anytls]
 password = "Lmpr9er8tTREFyZK5T..."
-idleCheckSecs = 30
-idleTimeoutSecs = 30
-minIdleSessions = 5
+idle_check_secs = 30
+idle_timeout_secs = 30
+min_idle_sessions = 5
 
 [client]
 listen = "mixed://127.0.0.1:2080"
-serverAddr = "123.45.67.89:443"
+server_addr = "123.45.67.89:443"
 
 Install complete. Server config: /etc/anyreality/config.toml; client config printed above.
 ```
 
-请将 从 `[reality]` 到 `serverAddr = "123.45.67.89:443"` 的文字复制粘贴并保存到本地的 `anyreality-client-config.toml` 文件里
+请将 从 `[reality]` 到 `server_addr = "123.45.67.89:443"` 的文字复制粘贴并保存到本地的 `anyreality-client-config.toml` 文件里
 作为 anyreality 客户端的 配置文件。
 
 客户端使用 REALITY 校验流程验证服务端每连接生成的临时证书。

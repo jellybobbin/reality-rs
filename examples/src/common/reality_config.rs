@@ -12,7 +12,6 @@ pub(crate) struct RealityDocument<T> {
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct RealityClientConfig {
     #[serde(alias = "password")]
     pub public_key: String,
@@ -24,7 +23,6 @@ pub(crate) struct RealityClientConfig {
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct RealityFallbackRuleConfig {
     #[serde(default)]
     pub server_names: Vec<String>,
@@ -38,7 +36,6 @@ pub(crate) struct RealityFallbackRuleConfig {
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct RealityServerConfig {
     pub private_key: String,
     pub short_ids: Vec<String>,
