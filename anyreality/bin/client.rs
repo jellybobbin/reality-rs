@@ -415,7 +415,7 @@ async fn handle_tcp_connect(connect_req: connect::Connect<connect::NeedReply>, t
     let stream = match client.create_stream().await {
         Ok(stream) => stream,
         Err(err) => {
-            if let Ok(mut failed) = connect_req.reply(Reply::GeneralFailure, Address::unspecified()).await {
+            if let Ok(mut failed) = connect_req.reply(Reply::GeneralFailure, Address::unspecified_v4()).await {
                 let _ = failed.shutdown().await;
             }
             return Err(err.into());
@@ -431,7 +431,7 @@ async fn handle_tcp_connect(connect_req: connect::Connect<connect::NeedReply>, t
     log::debug!("session={session_id} stream={stream_id} stage=target_submit protocol=socks5 target={target}",);
     let addr_bytes: Vec<u8> = target.clone().into();
     if let Err(err) = remote.write_all(&addr_bytes).await {
-        if let Ok(mut failed) = connect_req.reply(Reply::GeneralFailure, Address::unspecified()).await {
+        if let Ok(mut failed) = connect_req.reply(Reply::GeneralFailure, Address::unspecified_v4()).await {
             let _ = failed.shutdown().await;
         }
         return Err(err.into());
@@ -628,7 +628,7 @@ async fn handle_udp_associate(associate_req: UdpAssociate<associate::NeedReply>,
     let udp = match UdpSocket::bind(SocketAddr::from((listen_ip, 0))).await {
         Ok(socket) => socket,
         Err(err) => {
-            let mut reply = associate_req.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+            let mut reply = associate_req.reply(Reply::GeneralFailure, Address::unspecified_v4()).await?;
             reply.shutdown().await?;
             return Err(err.into());
         }
@@ -638,7 +638,7 @@ async fn handle_udp_associate(associate_req: UdpAssociate<associate::NeedReply>,
     let stream = match client.create_stream().await {
         Ok(s) => Arc::new(s),
         Err(err) => {
-            let mut reply = associate_req.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+            let mut reply = associate_req.reply(Reply::GeneralFailure, Address::unspecified_v4()).await?;
             reply.shutdown().await?;
             return Err(err.into());
         }
@@ -650,7 +650,7 @@ async fn handle_udp_associate(associate_req: UdpAssociate<associate::NeedReply>,
     //   sentinel address (SocksAddr) + UotRequest{Datagram, unspecified}
     log::debug!("session={session_id} stream={stream_id} stage=target_submit protocol=uot",);
     if let Err(err) = setup_uot_request(&stream).await {
-        let mut reply = associate_req.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+        let mut reply = associate_req.reply(Reply::GeneralFailure, Address::unspecified_v4()).await?;
         reply.shutdown().await?;
         return Err(err);
     }
@@ -711,7 +711,7 @@ async fn handle_udp_associate(associate_req: UdpAssociate<associate::NeedReply>,
 async fn setup_uot_request(stream: &Arc<AnytlsStream>) -> Result<()> {
     let sentinel: Vec<u8> = uot_sentinel_destination().into();
     stream.write(&sentinel).await?;
-    let request_bytes: Vec<u8> = UotRequest::new(UotMode::Datagram, Address::unspecified()).into();
+    let request_bytes: Vec<u8> = UotRequest::new(UotMode::Datagram, Address::unspecified_v4()).into();
     stream.write(&request_bytes).await?;
     Ok(())
 }
