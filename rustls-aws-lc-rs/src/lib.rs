@@ -45,7 +45,7 @@ use rustls::crypto::{
     CryptoProvider, GetRandomFailed, KeyProvider, SecureRandom, SigningKey, TicketProducer,
     TicketerFactory,
 };
-use rustls::error::{ApiMisuse, Error, OtherError};
+use rustls::error::{Error, OtherError};
 #[cfg(feature = "std")]
 use rustls::ticketer::TicketRotator;
 use zeroize::Zeroizing;
@@ -241,21 +241,6 @@ pub mod kx_group {
     pub use super::kx::{
         MLKEM768, MLKEM1024, SECP256R1, SECP256R1MLKEM768, SECP384R1, X25519, X25519MLKEM768,
     };
-}
-
-/// The region of `out` that a `len`-byte sealed record payload will occupy.
-///
-/// If `out` is shorter than `len` bytes, this returns [`ApiMisuse::EncryptBufferTooSmall`].
-fn record_region(out: &mut [u8], len: usize) -> Result<&mut [u8], Error> {
-    let provided = out.len();
-    match out.get_mut(..len) {
-        Some(record) => Ok(record),
-        None => Err(ApiMisuse::EncryptBufferTooSmall {
-            required: len,
-            provided,
-        }
-        .into()),
-    }
 }
 
 /// Are we in FIPS mode?
